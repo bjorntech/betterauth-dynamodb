@@ -12,7 +12,14 @@ bun run test:integration:local
 
 `bun run verify` runs typecheck, ESLint, coverage tests, the CRAP quality gate, and build. Run it before opening a PR or handing off work. For storage, transaction, pagination, TTL, client-construction, or key/index behavior changes, also run `bun run test:integration:local`.
 
-The local integration suite requires Docker. It uses Testcontainers with AWS's official `amazon/dynamodb-local:2.6.1` image, in-memory/shared DB mode, disabled telemetry, a random mapped port, fake credentials, isolated local tables, and Better Auth's official adapter conformance suites. CI runs it as a separate Docker-capable job and must fail if the container or tests fail.
+The local integration suite uses the pinned `dynoxide` 1.3.0 development dependency from [Dynoxide](https://dynoxide.dev/). `bun install --frozen-lockfile` installs its optional native platform binary; do not disable optional dependencies. No Docker or Java is required. Tests launch isolated in-memory processes bound to `127.0.0.1` on available ports, use fake credentials and isolated tables, and run Better Auth's official adapter conformance suites. CI runs the same command as a separate job and must fail if the emulator or tests fail. Never point these tests at a live AWS endpoint.
+
+For a manual local server, run `bun run dynamo:local --port 8000`. The automated suite starts and stops its own servers and does not need this command. If startup fails, check the error's captured Dynoxide output and reinstall with optional platform dependencies enabled.
+
+When changing Better Auth factory wiring, also check the declared minimum peer
+with the isolated [exact-peer workflow](./scripts/PEER-COMPAT.md). Keep the main
+manifest and lockfile on their intentional development versions; never commit
+temporary fixture installations.
 
 Useful focused commands:
 
@@ -31,7 +38,7 @@ Useful focused commands:
 - Do not lower coverage thresholds or exclude production implementation files to make a change pass.
 - Preserve the no-hidden-scan invariant: scan-shaped work must require explicit `unsafeAllowScan: true`.
 - Preserve atomic behavior for uniqueness, `consumeOne`, and `incrementOne`.
-- Use DynamoDB Local integration coverage for changes touching stored rows, sidecars, unique locks, logical TTL, pagination, injected-client behavior, or transaction conflicts. Do not treat DynamoDB Local as production parity for IAM, throttling, streams, TTL deletion timing, global tables, or AWS service capacity behavior.
+- Use local Dynoxide integration coverage for changes touching stored rows, sidecars, unique locks, logical TTL, pagination, injected-client behavior, or transaction conflicts. Do not treat an emulator as production parity for IAM, throttling, streams, TTL deletion timing, global tables, or AWS service capacity behavior.
 
 ## Documentation
 

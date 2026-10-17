@@ -23,6 +23,8 @@ Treat this repository as a future public open-source package. Do not rely on sib
 ## Invariants
 
 - **Atomic correctness matters.** Preserve conditional writes/deletes/updates for create uniqueness, `consumeOne`, and `incrementOne`. Do not weaken race handling for verification tokens, rate limits, or unique records.
+- **Callback commits are aggregate-atomic.** Scoped callback operations must buffer writes until one validated DynamoDB transaction commits. Never split an oversized callback into partial commits or claim snapshot/predicate isolation. Preserve original revision/absent-id guards, sidecar/lock maintenance, read-your-writes and closed-scope rejection.
+- **Cursor pages use continuation keys, not offsets.** Preserve one keyed Query page per companion call, query-bound cursor validation and native encoded-key ordering. Empty filtered pages may still have a continuation; never silently sort individual pages by an unindexed entity field or add a hidden scan.
 - **No hidden scans.** Queries that cannot use id equality or scalar field equality must throw unless `unsafeAllowScan: true` is explicitly configured. Do not add fallback scans, paginated table walks, or count/update/delete-many scans behind a friendly API.
 - **Injected client compatibility.** Keep `client?: DynamoDBDocumentClient` as the preferred production path so deploying applications own AWS region, credentials, middleware, tracing, and marshalling options.
 - **Stable key/index contract.** Changes to entity `pk`/`sk`, scalar sidecar keys, unique lock keys, hidden revision metadata, TTL defaults, or native index requirements are storage-format changes and require migration notes plus compatibility consideration.
@@ -58,7 +60,7 @@ bun run verify
 
 `bun run verify` is the required final check for code changes. It runs typecheck, lint, coverage tests, CRAP, and build.
 
-`bun run test:integration:local` is required when changes affect DynamoDB storage layout, sidecar/unique-lock maintenance, transaction semantics, logical TTL handling, pagination, query planning, or client creation/injection. It uses Testcontainers and AWS's official `amazon/dynamodb-local:2.6.1` Docker image with in-memory/shared DB mode and disabled telemetry. Keep it separate from `bun run verify` so unit coverage and CRAP remain fast and deterministic.
+`bun run test:integration:local` is required when changes affect DynamoDB storage layout, sidecar/unique-lock maintenance, transaction semantics, logical TTL handling, pagination, query planning, or client creation/injection. It launches the pinned local Dynoxide development dependency in memory on loopback with isolated processes/tables and fake credentials; install optional platform dependencies with `bun install --frozen-lockfile`. Docker and Java are not required. Keep it separate from `bun run verify` so unit coverage and CRAP remain fast and deterministic. Emulator coverage is not proof of live AWS IAM, throttling, physical TTL deletion timing or production conflict behavior.
 
 Coverage is enforced for production `src` code by `vitest.config.ts`. `src/types.ts` is excluded because it is type-only. Do not lower thresholds or exclude production implementation files to make a change pass.
 
@@ -87,6 +89,6 @@ Before changing public options, export names, key formats, default index names, 
 - The change is scoped to this repository and does not depend on sibling repos.
 - Public behavior is covered by tests where feasible.
 - `bun run verify` passes, including coverage and CRAP <= 6 for every production function.
-- `bun run test:integration:local` passes for storage/transaction/pagination/TTL/client behavior changes, or an exact Docker/environment blocker is reported.
+- `bun run test:integration:local` passes for storage/transaction/pagination/TTL/client behavior changes, or an exact Dynoxide/environment blocker is reported.
 - README/contributor docs are updated for public-facing behavior changes.
 - No secrets, local-only paths, generated build output, or coverage artifacts are newly committed.

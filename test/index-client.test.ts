@@ -98,7 +98,7 @@ describe("public adapter and client helpers", () => {
 
   it("rejects experimental native joins while leaving fallback joins to Better Auth", async () => {
     const send = vi.fn(async () => ({ Items: [] }));
-    const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never })({ secret: "x", advanced: { database: { joins: true } }, emailAndPassword: { enabled: true } } as never);
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never })({ secret: "x", experimental: { joins: true }, advanced: { database: { joins: true } }, emailAndPassword: { enabled: true } } as never);
 
     await expect(adapter.findMany({ model: "session", where: [{ field: "userId", value: "u1" }], limit: 1, join: { user: true } } as never)).rejects.toBeInstanceOf(UnsupportedQueryError);
     expect(send).not.toHaveBeenCalled();

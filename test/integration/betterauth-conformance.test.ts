@@ -1,43 +1,42 @@
 import {
-  CreateTableCommand,
-  DeleteTableCommand,
-  DynamoDBClient,
-  ListTablesCommand,
-  ResourceInUseException,
-  ResourceNotFoundException,
-  waitUntilTableExists
-} from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import {
   authFlowTestSuite,
   caseInsensitiveTestSuite,
   normalTestSuite,
+  transactionsTestSuite,
   testAdapter,
   uuidTestSuite
 } from "@better-auth/test-utils/adapter";
 import { randomUUID } from "node:crypto";
-import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
+import { createTable, deleteTable, startLocalDynamo } from "./local-dynamo.js";
 import { dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 
-const IMAGE = "amazon/dynamodb-local:2.6.1";
-const REGION = "us-east-1";
-const PORT = 8000;
-
-let container: StartedTestContainer;
-let nativeClient: DynamoDBClient;
-let docClient: DynamoDBDocumentClient;
 const tableName = `betterauth_dynamodb_conformance_${randomUUID().replaceAll("-", "")}`;
 
-await startDynamoDBLocal();
+const local = await startLocalDynamo();
+const { client: nativeClient, docClient } = local;
 
 const conformance = await testAdapter({
-  adapter: () => dynamoDBAdapter(adapterOptions()),
+  adapter: () => (options) => {
+    const adapter = dynamoDBAdapter(adapterOptions())(options);
+    const transaction = adapter.transaction;
+    // test-utils 1.6.25 mutates the shared adapter with `transaction = undefined`
+    // while building its wrapper, accidentally selecting the factory fallback.
+    // Preserve the real hook so its rollback test actually exercises transactions.
+    // Scoped adapters returned by this hook and all other methods stay unwrapped.
+    return new Proxy(adapter, {
+      get(target, property, receiver) {
+        return property === "transaction" ? transaction : Reflect.get(target, property, receiver);
+      },
+      set(target, property, value, receiver) {
+        if (property === "transaction" && value === undefined) return true;
+        return Reflect.set(target, property, value, receiver);
+      }
+    });
+  },
   runMigrations: () => createTable(nativeClient, tableName),
   onFinish: async () => {
-    await deleteTable(nativeClient, tableName);
-    nativeClient.destroy();
-    await container.stop();
+    try { await deleteTable(nativeClient, tableName); } finally { await local.stop(); }
   },
   overrideBetterAuthOptions: (options) => ({
     ...options,
@@ -55,10 +54,11 @@ const conformance = await testAdapter({
     caseInsensitiveTestSuite(),
     // Included: exercises Better Auth's public auth flows against the adapter. Verification cleanup is disabled
     // above because Better Auth's range-only cleanup is an unsupported scan-shaped production access pattern.
-    authFlowTestSuite()
+    authFlowTestSuite(),
+    // Included: verifies callback rollback. Additional bounded multi-item, read-your-writes and conflict
+    // semantics are covered in transactions.test.ts; callbacks do not promise predicate/phantom isolation.
+    transactionsTestSuite()
     // Excluded: numberIdTestSuite because supportsNumericIds=false.
-    // Excluded: transactionsTestSuite because config.transaction=false and DynamoDB cannot support Better Auth's
-    // arbitrary callback transaction contract honestly.
     // Excluded: joinsTestSuite because experimental native joins are rejected; Better Auth fallback joins are
     // covered by the normal/UUID suites, while native join tests would conflict with the adapter invariant.
   ],
@@ -74,60 +74,4 @@ function adapterOptions(): BetterAuthDynamoDBOptions {
     unsafeAllowScan: true,
     maxPages: 100
   };
-}
-
-async function startDynamoDBLocal(): Promise<void> {
-  container = await new GenericContainer(IMAGE)
-    .withExposedPorts(PORT)
-    .withCommand(["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb", "-disableTelemetry"])
-    .withWaitStrategy(Wait.forListeningPorts())
-    .start();
-  const endpoint = `http://${container.getHost()}:${container.getMappedPort(PORT)}`;
-  nativeClient = new DynamoDBClient({ region: REGION, endpoint, credentials: { accessKeyId: "fake", secretAccessKey: "fake" } });
-  docClient = DynamoDBDocumentClient.from(nativeClient, { marshallOptions: { removeUndefinedValues: true } });
-  await waitForDynamoDBLocal(nativeClient);
-}
-
-async function waitForDynamoDBLocal(client: DynamoDBClient): Promise<void> {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      await client.send(new ListTablesCommand({}));
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-  await client.send(new ListTablesCommand({}));
-}
-
-async function createTable(client: DynamoDBClient, name: string): Promise<void> {
-  try {
-    await client.send(
-      new CreateTableCommand({
-        TableName: name,
-        BillingMode: "PAY_PER_REQUEST",
-        AttributeDefinitions: [
-          { AttributeName: "pk", AttributeType: "S" },
-          { AttributeName: "sk", AttributeType: "S" }
-        ],
-        KeySchema: [
-          { AttributeName: "pk", KeyType: "HASH" },
-          { AttributeName: "sk", KeyType: "RANGE" }
-        ]
-      })
-    );
-  } catch (error) {
-    if (error instanceof ResourceInUseException) return;
-    throw error;
-  }
-  await waitUntilTableExists({ client, maxWaitTime: 30 }, { TableName: name });
-}
-
-async function deleteTable(client: DynamoDBClient, name: string): Promise<void> {
-  try {
-    await client.send(new DeleteTableCommand({ TableName: name }));
-  } catch (error) {
-    if (error instanceof ResourceNotFoundException) return;
-    throw error;
-  }
 }

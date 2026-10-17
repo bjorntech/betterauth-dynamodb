@@ -1,31 +1,24 @@
-import {
-  CreateTableCommand,
-  DeleteTableCommand,
-  DynamoDBClient,
-  ListTablesCommand,
-  ResourceNotFoundException,
-  waitUntilTableExists
-} from "@aws-sdk/client-dynamodb";
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import type { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DeleteCommand, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
+import { createTable, deleteTable, startLocalDynamo } from "./local-dynamo.js";
+import type { LocalDynamo } from "./local-dynamo.js";
 import { betterAuth } from "better-auth";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
+import { getAuthTables } from "@better-auth/core/db";
+import { createAdapterFactory } from "better-auth/adapters";
+import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
+import { collectSchemaUniqueIndexes, DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
 
-const IMAGE = "amazon/dynamodb-local:2.6.1";
-const REGION = "us-east-1";
-const PORT = 8000;
-
 type TestAdapter = ReturnType<ReturnType<typeof dynamoDBAdapter>>;
 type Where = { field: string; value: string | number | boolean | string[] | number[] | null; operator: "eq" | "in" | "contains"; connector: "AND"; mode: "sensitive" | "insensitive" };
 
-let container: StartedTestContainer;
-let endpoint: string;
+let local: LocalDynamo;
 let nativeClient: DynamoDBClient;
 let docClient: DynamoDBDocumentClient;
 let tableName: string;
@@ -37,20 +30,12 @@ const contains = (field: string, value: string): Where => ({ field, value, opera
 
 describe("DynamoDB Local adapter integration", () => {
   beforeAll(async () => {
-    container = await new GenericContainer(IMAGE)
-      .withExposedPorts(PORT)
-      .withCommand(["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb", "-disableTelemetry"])
-      .withWaitStrategy(Wait.forListeningPorts())
-      .start();
-    endpoint = `http://${container.getHost()}:${container.getMappedPort(PORT)}`;
-    nativeClient = new DynamoDBClient({ region: REGION, endpoint, credentials: { accessKeyId: "fake", secretAccessKey: "fake" } });
-    docClient = DynamoDBDocumentClient.from(nativeClient, { marshallOptions: { removeUndefinedValues: true } });
-    await waitForDynamoDBLocal(nativeClient);
+    local = await startLocalDynamo();
+    ({ client: nativeClient, docClient } = local);
   });
 
   afterAll(async () => {
-    await nativeClient?.destroy();
-    await container?.stop();
+    await local?.stop();
   });
 
   beforeEach(async () => {
@@ -334,7 +319,7 @@ describe("DynamoDB Local adapter integration", () => {
   });
 
   it("requires physical TTL cleanup before replacing an expired compound-index record", async () => {
-    const adapter = dynamoDBAdapter({ tableName, client: docClient, ttl: { fields: { oauthClientResource: "expiresAt" } }, enforceSchemaUniqueIndexes: true } as never)(schemaAuthOptions() as never) as TestAdapter;
+    const adapter = schemaFixtureAdapter({ tableName, client: docClient, ttl: { fields: { oauthClientResource: "expiresAt" } }, enforceSchemaUniqueIndexes: true });
     await create(adapter, "oauthClientResource", { id: "expired-compound", clientId: "client-expired", resourceId: "resource-expired", expiresAt: "2000-01-01T00:00:00.000Z" });
     await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-expired")], limit: 10 })).resolves.toEqual([]);
     await expect(create(adapter, "oauthClientResource", { id: "blocked-compound", clientId: "client-expired", resourceId: "resource-expired" })).rejects.toBeInstanceOf(DynamoDBConflictError);
@@ -361,13 +346,17 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com" } });
   });
 
-  it("uses the published OAuth provider schema for resource IN and refresh-family cleanup", async () => {
+  // oauthClientResource and its compound index were introduced after provider 1.6.25.
+  it.skipIf(!("oauthClientResource" in oauthProvider({ loginPage: "/login", consentPage: "/consent" }).schema))("uses the published OAuth provider schema for resource IN", async () => {
     const adapter = realProviderAdapter(true);
     await create(adapter, "oauthClientResource", { id: "provider-resource-1", clientId: "provider-client", resourceId: "resource-a" });
     await create(adapter, "oauthClientResource", { id: "provider-resource-2", clientId: "provider-client", resourceId: "resource-b" });
     await expect(create(adapter, "oauthClientResource", { id: "provider-resource-duplicate", clientId: "provider-client", resourceId: "resource-a" })).rejects.toBeInstanceOf(DynamoDBConflictError);
     await expect(adapter.findMany({ model: "oauthClientResource", where: [inValues("resourceId", ["resource-a", "resource-b"])], limit: 10 })).resolves.toHaveLength(2);
+  });
 
+  it("uses the published OAuth provider schema for refresh-family cleanup", async () => {
+    const adapter = realProviderAdapter(true);
     await create(adapter, "oauthRefreshToken", { id: "refresh-family", token: "refresh-token", clientId: "provider-client", userId: "provider-user", scopes: [] });
     await create(adapter, "oauthAccessToken", { id: "access-family-1", token: "access-token-1", clientId: "provider-client", userId: "provider-user", refreshId: "refresh-family", scopes: [] });
     await create(adapter, "oauthAccessToken", { id: "access-family-2", token: "access-token-2", clientId: "provider-client", userId: "provider-user", refreshId: "refresh-family", scopes: [] });
@@ -489,9 +478,9 @@ function schemaAuthOptions() {
         schema: {
           oauthClientResource: {
             fields: {
-              clientId: { type: "string", required: true },
-              resourceId: { type: "string", required: true },
-              expiresAt: { type: "string", required: false }
+              clientId: { type: "string", required: true, unique: false },
+              resourceId: { type: "string", required: true, unique: false },
+              expiresAt: { type: "string", required: false, unique: false }
             },
             indexes: [{ fields: ["clientId", "resourceId"], unique: true }]
           }
@@ -502,11 +491,34 @@ function schemaAuthOptions() {
 }
 
 function schemaIndexAdapter(enforce: boolean, maxPages?: number): TestAdapter {
-  return dynamoDBAdapter({ tableName, client: docClient, ...(maxPages ? { maxPages } : {}), ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)(schemaAuthOptions() as never) as TestAdapter;
+  return schemaFixtureAdapter({ tableName, client: docClient, ...(maxPages ? { maxPages } : {}), ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) });
 }
 
 function schemaIndexAdapterWithClient(enforce: boolean, client: DynamoDBDocumentClient): TestAdapter {
-  return dynamoDBAdapter({ tableName, client, ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)(schemaAuthOptions() as never) as TestAdapter;
+  return schemaFixtureAdapter({ tableName, client, ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) });
+}
+
+function schemaFixtureAdapter(options: BetterAuthDynamoDBOptions): TestAdapter {
+  const auth = schemaAuthOptions();
+  const tables = getAuthTables(auth as never) as Record<string, { indexes?: readonly unknown[] }>;
+  if (tables.oauthClientResource?.indexes?.length) return dynamoDBAdapter(options)(auth as never);
+  // Core 1.6 drops plugin table-level indexes in getAuthTables. Supply the explicit
+  // fixture to the store, retaining the real factory's CRUD transformations. This
+  // tests storage semantics, not nonexistent 1.6 schema-index discovery support.
+  const store = new DynamoDBStore({ ...options, schemaUniqueIndexes: options.enforceSchemaUniqueIndexes ? collectSchemaUniqueIndexes(auth.plugins[0]!.schema, (model) => model, ({ field }) => field) : [] });
+  return createAdapterFactory({
+    config: { adapterId: "compound-storage-fixture", supportsDates: false, supportsBooleans: true, supportsJSON: true, supportsArrays: true, transaction: false },
+    adapter: () => ({
+      create: ({ model, data }: any) => store.create(model, data),
+      findOne: ({ model, where, select }: any) => store.findOne(model, where, select),
+      findMany: ({ model, where, limit, offset, sortBy, select }: any) => store.findMany(model, where, limit, offset, sortBy, select),
+      count: ({ model, where }: any) => store.count(model, where),
+      update: ({ model, where, update }: any) => store.update(model, where, update),
+      updateMany: ({ model, where, update }: any) => store.updateMany(model, where, update),
+      delete: ({ model, where }: any) => store.delete(model, where),
+      deleteMany: ({ model, where }: any) => store.deleteMany(model, where)
+    })
+  })(auth as never) as TestAdapter;
 }
 
 function realProviderAdapter(enforce: boolean): TestAdapter {
@@ -590,45 +602,6 @@ async function sendWithReadBarrier(command: any, barrier: ReadBarrier, pk: strin
   if (command instanceof GetCommand && command.input.ConsistentRead === true && command.input.Key?.pk === pk && command.input.Key?.sk === sk) await barrier.wait();
   if (command instanceof TransactWriteCommand) return result;
   return result;
-}
-
-async function waitForDynamoDBLocal(client: DynamoDBClient): Promise<void> {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      await client.send(new ListTablesCommand({}));
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-  await client.send(new ListTablesCommand({}));
-}
-
-async function createTable(client: DynamoDBClient, name: string): Promise<void> {
-  await client.send(
-    new CreateTableCommand({
-      TableName: name,
-      BillingMode: "PAY_PER_REQUEST",
-      AttributeDefinitions: [
-        { AttributeName: "pk", AttributeType: "S" },
-        { AttributeName: "sk", AttributeType: "S" }
-      ],
-      KeySchema: [
-        { AttributeName: "pk", KeyType: "HASH" },
-        { AttributeName: "sk", KeyType: "RANGE" }
-      ]
-    })
-  );
-  await waitUntilTableExists({ client, maxWaitTime: 30 }, { TableName: name });
-}
-
-async function deleteTable(client: DynamoDBClient, name: string): Promise<void> {
-  try {
-    await client.send(new DeleteTableCommand({ TableName: name }));
-  } catch (error) {
-    if (error instanceof ResourceNotFoundException) return;
-    throw error;
-  }
 }
 
 async function rawRow(pk: string, sk: string): Promise<Record<string, unknown> | undefined> {
