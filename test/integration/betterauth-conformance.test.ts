@@ -2,6 +2,7 @@ import {
   authFlowTestSuite,
   caseInsensitiveTestSuite,
   normalTestSuite,
+  transactionsTestSuite,
   testAdapter,
   uuidTestSuite
 } from "@better-auth/test-utils/adapter";
@@ -37,10 +38,11 @@ const conformance = await testAdapter({
     caseInsensitiveTestSuite(),
     // Included: exercises Better Auth's public auth flows against the adapter. Verification cleanup is disabled
     // above because Better Auth's range-only cleanup is an unsupported scan-shaped production access pattern.
-    authFlowTestSuite()
+    authFlowTestSuite(),
+    // Included: verifies callback rollback. Additional bounded multi-item, read-your-writes and conflict
+    // semantics are covered in transactions.test.ts; callbacks do not promise predicate/phantom isolation.
+    transactionsTestSuite()
     // Excluded: numberIdTestSuite because supportsNumericIds=false.
-    // Excluded: transactionsTestSuite because config.transaction=false and DynamoDB cannot support Better Auth's
-    // arbitrary callback transaction contract honestly.
     // Excluded: joinsTestSuite because experimental native joins are rejected; Better Auth fallback joins are
     // covered by the normal/UUID suites, while native join tests would conflict with the adapter invariant.
   ],

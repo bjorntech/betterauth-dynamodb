@@ -19,8 +19,8 @@ const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
 
 export class DynamoDBStore {
-  private readonly client: DynamoDBDocumentClient;
-  private readonly options: ReturnType<typeof normalizeOptions<DynamoDBStoreOptions>>;
+  protected readonly client: DynamoDBDocumentClient;
+  protected readonly options: ReturnType<typeof normalizeOptions<DynamoDBStoreOptions>>;
 
   constructor(options: DynamoDBStoreOptions) {
     this.options = normalizeOptions(options);
@@ -132,7 +132,7 @@ export class DynamoDBStore {
     return rows.length;
   }
 
-  private async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
+  protected async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
     if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where);
@@ -166,14 +166,14 @@ export class DynamoDBStore {
     const actions = items.map((item) => putNewOf(this.options.tableName, item));
     assertTransactionActions(actions);
     try {
-      await this.client.send(new TransactWriteCommand(transactInput(actions)));
+      await this.sendTransactionActions(actions);
     } catch (error) {
       if (isWriteRace(error)) throw conflictError(operation, error);
       throw error;
     }
   }
 
-  private async transactReplace(model: string, oldItem: StoredItem, newItem: StoredItem): Promise<void> {
+  protected async transactReplace(model: string, oldItem: StoredItem, newItem: StoredItem): Promise<void> {
     const oldSidecars = this.allSidecars(model, oldItem.entity);
     const newSidecars = this.allSidecars(model, newItem.entity);
     const deletes = removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item));
@@ -183,22 +183,27 @@ export class DynamoDBStore {
     const entity = { Put: { TableName: this.options.tableName, Item: newItem, ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
     const actions = [entity, ...deletes, ...puts, ...updates];
     assertTransactionActions(actions);
-    await this.client.send(new TransactWriteCommand(transactInput(actions)));
+    await this.sendTransactionActions(actions);
   }
 
-  private async transactDelete(item: StoredItem): Promise<void> {
+  protected async transactDelete(item: StoredItem): Promise<void> {
     const condition = revisionCondition(item);
     const entity = { Delete: { TableName: this.options.tableName, Key: keyOf(item), ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
     const sidecars = this.allSidecars(String(item.model), item.entity).map((sidecar) => deleteOf(this.options.tableName, sidecar));
     const actions = [entity, ...sidecars];
     assertTransactionActions(actions);
-    await this.client.send(new TransactWriteCommand(transactInput(actions)));
+    await this.sendTransactionActions(actions);
   }
 
-  private async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
+  protected async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
     const oldSidecars = this.allSidecars(model, oldItem.entity);
     const newSidecars = this.allSidecars(model, newItem.entity);
     const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl))];
+    assertTransactionActions(actions);
+    await this.sendTransactionActions(actions);
+  }
+
+  protected async sendTransactionActions(actions: NonNullable<TransactWriteCommandInput["TransactItems"]>): Promise<void> {
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
