@@ -1,14 +1,4 @@
 import {
-  CreateTableCommand,
-  DeleteTableCommand,
-  DynamoDBClient,
-  ListTablesCommand,
-  ResourceInUseException,
-  ResourceNotFoundException,
-  waitUntilTableExists
-} from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import {
   authFlowTestSuite,
   caseInsensitiveTestSuite,
   normalTestSuite,
@@ -16,28 +6,20 @@ import {
   uuidTestSuite
 } from "@better-auth/test-utils/adapter";
 import { randomUUID } from "node:crypto";
-import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
+import { createTable, deleteTable, startLocalDynamo } from "./local-dynamo.js";
 import { dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 
-const IMAGE = "amazon/dynamodb-local:2.6.1";
-const REGION = "us-east-1";
-const PORT = 8000;
-
-let container: StartedTestContainer;
-let nativeClient: DynamoDBClient;
-let docClient: DynamoDBDocumentClient;
 const tableName = `betterauth_dynamodb_conformance_${randomUUID().replaceAll("-", "")}`;
 
-await startDynamoDBLocal();
+const local = await startLocalDynamo();
+const { client: nativeClient, docClient } = local;
 
 const conformance = await testAdapter({
   adapter: () => dynamoDBAdapter(adapterOptions()),
   runMigrations: () => createTable(nativeClient, tableName),
   onFinish: async () => {
-    await deleteTable(nativeClient, tableName);
-    nativeClient.destroy();
-    await container.stop();
+    try { await deleteTable(nativeClient, tableName); } finally { await local.stop(); }
   },
   overrideBetterAuthOptions: (options) => ({
     ...options,
@@ -74,60 +56,4 @@ function adapterOptions(): BetterAuthDynamoDBOptions {
     unsafeAllowScan: true,
     maxPages: 100
   };
-}
-
-async function startDynamoDBLocal(): Promise<void> {
-  container = await new GenericContainer(IMAGE)
-    .withExposedPorts(PORT)
-    .withCommand(["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb", "-disableTelemetry"])
-    .withWaitStrategy(Wait.forListeningPorts())
-    .start();
-  const endpoint = `http://${container.getHost()}:${container.getMappedPort(PORT)}`;
-  nativeClient = new DynamoDBClient({ region: REGION, endpoint, credentials: { accessKeyId: "fake", secretAccessKey: "fake" } });
-  docClient = DynamoDBDocumentClient.from(nativeClient, { marshallOptions: { removeUndefinedValues: true } });
-  await waitForDynamoDBLocal(nativeClient);
-}
-
-async function waitForDynamoDBLocal(client: DynamoDBClient): Promise<void> {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      await client.send(new ListTablesCommand({}));
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-  await client.send(new ListTablesCommand({}));
-}
-
-async function createTable(client: DynamoDBClient, name: string): Promise<void> {
-  try {
-    await client.send(
-      new CreateTableCommand({
-        TableName: name,
-        BillingMode: "PAY_PER_REQUEST",
-        AttributeDefinitions: [
-          { AttributeName: "pk", AttributeType: "S" },
-          { AttributeName: "sk", AttributeType: "S" }
-        ],
-        KeySchema: [
-          { AttributeName: "pk", KeyType: "HASH" },
-          { AttributeName: "sk", KeyType: "RANGE" }
-        ]
-      })
-    );
-  } catch (error) {
-    if (error instanceof ResourceInUseException) return;
-    throw error;
-  }
-  await waitUntilTableExists({ client, maxWaitTime: 30 }, { TableName: name });
-}
-
-async function deleteTable(client: DynamoDBClient, name: string): Promise<void> {
-  try {
-    await client.send(new DeleteTableCommand({ TableName: name }));
-  } catch (error) {
-    if (error instanceof ResourceNotFoundException) return;
-    throw error;
-  }
 }

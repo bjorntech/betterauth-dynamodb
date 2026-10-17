@@ -20,6 +20,5 @@ jobs:
         with:
           bun-version: 1.2.5
       - run: bun install --frozen-lockfile
-      - run: docker version
-      - run: docker pull amazon/dynamodb-local:2.6.1
+      - run: bun run dynamo:local --help
       - run: bun run test:integration:local

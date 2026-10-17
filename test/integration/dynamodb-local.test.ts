@@ -1,15 +1,10 @@
-import {
-  CreateTableCommand,
-  DeleteTableCommand,
-  DynamoDBClient,
-  ListTablesCommand,
-  ResourceNotFoundException,
-  waitUntilTableExists
-} from "@aws-sdk/client-dynamodb";
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import type { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DeleteCommand, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
+import { createTable, deleteTable, startLocalDynamo } from "./local-dynamo.js";
+import type { LocalDynamo } from "./local-dynamo.js";
 import { betterAuth } from "better-auth";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
@@ -17,15 +12,10 @@ import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
 
-const IMAGE = "amazon/dynamodb-local:2.6.1";
-const REGION = "us-east-1";
-const PORT = 8000;
-
 type TestAdapter = ReturnType<ReturnType<typeof dynamoDBAdapter>>;
 type Where = { field: string; value: string | number | boolean | string[] | number[] | null; operator: "eq" | "in" | "contains"; connector: "AND"; mode: "sensitive" | "insensitive" };
 
-let container: StartedTestContainer;
-let endpoint: string;
+let local: LocalDynamo;
 let nativeClient: DynamoDBClient;
 let docClient: DynamoDBDocumentClient;
 let tableName: string;
@@ -37,20 +27,12 @@ const contains = (field: string, value: string): Where => ({ field, value, opera
 
 describe("DynamoDB Local adapter integration", () => {
   beforeAll(async () => {
-    container = await new GenericContainer(IMAGE)
-      .withExposedPorts(PORT)
-      .withCommand(["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb", "-disableTelemetry"])
-      .withWaitStrategy(Wait.forListeningPorts())
-      .start();
-    endpoint = `http://${container.getHost()}:${container.getMappedPort(PORT)}`;
-    nativeClient = new DynamoDBClient({ region: REGION, endpoint, credentials: { accessKeyId: "fake", secretAccessKey: "fake" } });
-    docClient = DynamoDBDocumentClient.from(nativeClient, { marshallOptions: { removeUndefinedValues: true } });
-    await waitForDynamoDBLocal(nativeClient);
+    local = await startLocalDynamo();
+    ({ client: nativeClient, docClient } = local);
   });
 
   afterAll(async () => {
-    await nativeClient?.destroy();
-    await container?.stop();
+    await local?.stop();
   });
 
   beforeEach(async () => {
@@ -590,45 +572,6 @@ async function sendWithReadBarrier(command: any, barrier: ReadBarrier, pk: strin
   if (command instanceof GetCommand && command.input.ConsistentRead === true && command.input.Key?.pk === pk && command.input.Key?.sk === sk) await barrier.wait();
   if (command instanceof TransactWriteCommand) return result;
   return result;
-}
-
-async function waitForDynamoDBLocal(client: DynamoDBClient): Promise<void> {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      await client.send(new ListTablesCommand({}));
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
-  await client.send(new ListTablesCommand({}));
-}
-
-async function createTable(client: DynamoDBClient, name: string): Promise<void> {
-  await client.send(
-    new CreateTableCommand({
-      TableName: name,
-      BillingMode: "PAY_PER_REQUEST",
-      AttributeDefinitions: [
-        { AttributeName: "pk", AttributeType: "S" },
-        { AttributeName: "sk", AttributeType: "S" }
-      ],
-      KeySchema: [
-        { AttributeName: "pk", KeyType: "HASH" },
-        { AttributeName: "sk", KeyType: "RANGE" }
-      ]
-    })
-  );
-  await waitUntilTableExists({ client, maxWaitTime: 30 }, { TableName: name });
-}
-
-async function deleteTable(client: DynamoDBClient, name: string): Promise<void> {
-  try {
-    await client.send(new DeleteTableCommand({ TableName: name }));
-  } catch (error) {
-    if (error instanceof ResourceNotFoundException) return;
-    throw error;
-  }
 }
 
 async function rawRow(pk: string, sk: string): Promise<Record<string, unknown> | undefined> {
