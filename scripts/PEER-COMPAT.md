@@ -42,8 +42,22 @@ Without that flag it is also useful for the original baseline. It does not claim
 AWS production compatibility. Run the integration suite too for pagination and
 storage semantics; this smoke does not substitute for cursor-companion tests.
 
-Baseline at the original adapter plus the Dynoxide infrastructure commit:
-typecheck passed; units 92/93 (native joins use the 1.7 configuration spelling);
-integration 267/272 (all 238 official conformance cases passed). The five integration failures assume 1.7 OAuth-provider
-models/schema indexes absent from 1.6.25. These suite-version assumptions must
-not be mistaken for failures of package loading or basic adapter CRUD.
+With version-compatible test fixtures, the original adapter plus the Dynoxide
+infrastructure passes `bun run verify` against exact 1.6.25 (93 unit tests,
+coverage, CRAP and build). Integration passes 272 tests, including all 238
+official conformance cases; one provider-resource test is explicitly skipped.
+
+Core 1.6.25's `getAuthTables` drops plugin table-level `indexes` metadata.
+Compound-lock integration tests therefore use an explicit standalone store
+schema fixture through the real adapter factory on that version. They still run
+all atomicity, TTL, update/delete and stale-ownership assertions; they do not
+claim that schema-index discovery exists on 1.6. On versions retaining the
+metadata, those tests continue using the unmodified public adapter path.
+
+Provider 1.6.25 has no `oauthClientResource` model, so only the test of that
+published model is capability-skipped. The provider refresh-family cleanup test
+continues to run on both versions. Native joins enable both version-specific
+configuration spellings. No adapter failures are excluded or masked.
+
+The same compatibility edits pass `bun run verify` and all 273 integration
+tests against the root's exact 1.7.5 peer family, with no skipped tests.

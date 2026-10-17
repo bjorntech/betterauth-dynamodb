@@ -7,7 +7,10 @@ import { createTable, deleteTable, startLocalDynamo } from "./local-dynamo.js";
 import type { LocalDynamo } from "./local-dynamo.js";
 import { betterAuth } from "better-auth";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
+import { getAuthTables } from "@better-auth/core/db";
+import { createAdapterFactory } from "better-auth/adapters";
+import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
+import { collectSchemaUniqueIndexes, DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
@@ -316,7 +319,7 @@ describe("DynamoDB Local adapter integration", () => {
   });
 
   it("requires physical TTL cleanup before replacing an expired compound-index record", async () => {
-    const adapter = dynamoDBAdapter({ tableName, client: docClient, ttl: { fields: { oauthClientResource: "expiresAt" } }, enforceSchemaUniqueIndexes: true } as never)(schemaAuthOptions() as never) as TestAdapter;
+    const adapter = schemaFixtureAdapter({ tableName, client: docClient, ttl: { fields: { oauthClientResource: "expiresAt" } }, enforceSchemaUniqueIndexes: true });
     await create(adapter, "oauthClientResource", { id: "expired-compound", clientId: "client-expired", resourceId: "resource-expired", expiresAt: "2000-01-01T00:00:00.000Z" });
     await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-expired")], limit: 10 })).resolves.toEqual([]);
     await expect(create(adapter, "oauthClientResource", { id: "blocked-compound", clientId: "client-expired", resourceId: "resource-expired" })).rejects.toBeInstanceOf(DynamoDBConflictError);
@@ -343,13 +346,17 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com" } });
   });
 
-  it("uses the published OAuth provider schema for resource IN and refresh-family cleanup", async () => {
+  // oauthClientResource and its compound index were introduced after provider 1.6.25.
+  it.skipIf(!("oauthClientResource" in oauthProvider({ loginPage: "/login", consentPage: "/consent" }).schema))("uses the published OAuth provider schema for resource IN", async () => {
     const adapter = realProviderAdapter(true);
     await create(adapter, "oauthClientResource", { id: "provider-resource-1", clientId: "provider-client", resourceId: "resource-a" });
     await create(adapter, "oauthClientResource", { id: "provider-resource-2", clientId: "provider-client", resourceId: "resource-b" });
     await expect(create(adapter, "oauthClientResource", { id: "provider-resource-duplicate", clientId: "provider-client", resourceId: "resource-a" })).rejects.toBeInstanceOf(DynamoDBConflictError);
     await expect(adapter.findMany({ model: "oauthClientResource", where: [inValues("resourceId", ["resource-a", "resource-b"])], limit: 10 })).resolves.toHaveLength(2);
+  });
 
+  it("uses the published OAuth provider schema for refresh-family cleanup", async () => {
+    const adapter = realProviderAdapter(true);
     await create(adapter, "oauthRefreshToken", { id: "refresh-family", token: "refresh-token", clientId: "provider-client", userId: "provider-user", scopes: [] });
     await create(adapter, "oauthAccessToken", { id: "access-family-1", token: "access-token-1", clientId: "provider-client", userId: "provider-user", refreshId: "refresh-family", scopes: [] });
     await create(adapter, "oauthAccessToken", { id: "access-family-2", token: "access-token-2", clientId: "provider-client", userId: "provider-user", refreshId: "refresh-family", scopes: [] });
@@ -471,9 +478,9 @@ function schemaAuthOptions() {
         schema: {
           oauthClientResource: {
             fields: {
-              clientId: { type: "string", required: true },
-              resourceId: { type: "string", required: true },
-              expiresAt: { type: "string", required: false }
+              clientId: { type: "string", required: true, unique: false },
+              resourceId: { type: "string", required: true, unique: false },
+              expiresAt: { type: "string", required: false, unique: false }
             },
             indexes: [{ fields: ["clientId", "resourceId"], unique: true }]
           }
@@ -484,11 +491,34 @@ function schemaAuthOptions() {
 }
 
 function schemaIndexAdapter(enforce: boolean, maxPages?: number): TestAdapter {
-  return dynamoDBAdapter({ tableName, client: docClient, ...(maxPages ? { maxPages } : {}), ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)(schemaAuthOptions() as never) as TestAdapter;
+  return schemaFixtureAdapter({ tableName, client: docClient, ...(maxPages ? { maxPages } : {}), ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) });
 }
 
 function schemaIndexAdapterWithClient(enforce: boolean, client: DynamoDBDocumentClient): TestAdapter {
-  return dynamoDBAdapter({ tableName, client, ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)(schemaAuthOptions() as never) as TestAdapter;
+  return schemaFixtureAdapter({ tableName, client, ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) });
+}
+
+function schemaFixtureAdapter(options: BetterAuthDynamoDBOptions): TestAdapter {
+  const auth = schemaAuthOptions();
+  const tables = getAuthTables(auth as never) as Record<string, { indexes?: readonly unknown[] }>;
+  if (tables.oauthClientResource?.indexes?.length) return dynamoDBAdapter(options)(auth as never);
+  // Core 1.6 drops plugin table-level indexes in getAuthTables. Supply the explicit
+  // fixture to the store, retaining the real factory's CRUD transformations. This
+  // tests storage semantics, not nonexistent 1.6 schema-index discovery support.
+  const store = new DynamoDBStore({ ...options, schemaUniqueIndexes: options.enforceSchemaUniqueIndexes ? collectSchemaUniqueIndexes(auth.plugins[0]!.schema, (model) => model, ({ field }) => field) : [] });
+  return createAdapterFactory({
+    config: { adapterId: "compound-storage-fixture", supportsDates: false, supportsBooleans: true, supportsJSON: true, supportsArrays: true, transaction: false },
+    adapter: () => ({
+      create: ({ model, data }: any) => store.create(model, data),
+      findOne: ({ model, where, select }: any) => store.findOne(model, where, select),
+      findMany: ({ model, where, limit, offset, sortBy, select }: any) => store.findMany(model, where, limit, offset, sortBy, select),
+      count: ({ model, where }: any) => store.count(model, where),
+      update: ({ model, where, update }: any) => store.update(model, where, update),
+      updateMany: ({ model, where, update }: any) => store.updateMany(model, where, update),
+      delete: ({ model, where }: any) => store.delete(model, where),
+      deleteMany: ({ model, where }: any) => store.deleteMany(model, where)
+    })
+  })(auth as never) as TestAdapter;
 }
 
 function realProviderAdapter(enforce: boolean): TestAdapter {
