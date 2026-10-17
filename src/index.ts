@@ -2,10 +2,23 @@ import { createAdapterFactory } from "better-auth/adapters";
 import { DynamoDBStore } from "./dynamodb-adapter.js";
 import { UnsupportedQueryError } from "./errors.js";
 import { compoundUniqueIndexName } from "./keys.js";
-import type { BetterAuthDynamoDBOptions, SchemaUniqueIndex } from "./types.js";
+import type { BetterAuthDynamoDBOptions, DynamoDBPaginator, SchemaUniqueIndex } from "./types.js";
 
-export type { BetterAuthDynamoDBOptions, TtlOptions } from "./types.js";
+export type { BetterAuthDynamoDBOptions, TtlOptions, CleanedWhere, DynamoDBPageRequest, DynamoDBPage, DynamoDBPaginator } from "./types.js";
 export { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "./errors.js";
+
+/**
+ * Read-only companion to Better Auth's offset-based API; uses exact storage names.
+ * Requires an id/scalar equality anchor; never scans or fans out IN predicates.
+ * Pages are evaluated keys, so filters/TTL can yield empty items plus nextCursor.
+ * Native encoded key order is length-prefixed byte order, not entity-field order.
+ * Cursors are validated, not signed/encrypted: never use them for authorization.
+ * Concurrent inserts before the continuation key are not revisited; no snapshot is promised.
+ */
+export function createDynamoDBPaginator(options: BetterAuthDynamoDBOptions): DynamoDBPaginator {
+  const store = new DynamoDBStore(options);
+  return { findPage: (request) => store.findPage(request) };
+}
 
 export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
   return createAdapterFactory({

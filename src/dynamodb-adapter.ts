@@ -8,10 +8,11 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { createDocumentClient, normalizeOptions } from "./client.js";
+import { findPage } from "./cursor.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, transactionCancellationCodes } from "./errors.js";
 import { entitySk, indexPk, modelPk } from "./keys.js";
 import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
-import type { CleanedWhere, DynamoDBStoreOptions, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
+import type { CleanedWhere, DynamoDBPage, DynamoDBPageRequest, DynamoDBStoreOptions, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
 import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, scalarValues } from "./where.js";
 
 const MAX_TRANSACT_ITEMS = 100;
@@ -47,6 +48,10 @@ export class DynamoDBStore {
     const plan = planQuery(where, this.options.unsafeAllowScan);
     const rows = await this.loadRows(model, plan);
     return rows.filter((row) => matchesWhere(row, where)).length;
+  }
+
+  findPage<T>(request: DynamoDBPageRequest): Promise<DynamoDBPage<T>> {
+    return findPage<T>(this.client, this.options, request, (items, clause) => this.loadOwners(items, clause));
   }
 
   async update<T>(model: string, where: CleanedWhere[], update: Record<string, unknown>): Promise<T | null> {
