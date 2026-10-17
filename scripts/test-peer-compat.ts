@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { dynamoDBAdapter } from "../src/index.js";
+import { createDynamoDBPaginator, dynamoDBAdapter } from "../src/index.js";
 import { createTable, deleteTable, startLocalDynamo } from "../test/integration/local-dynamo.js";
 
 const require = createRequire(import.meta.url);
@@ -56,6 +56,24 @@ try {
   assert.equal(selected?.email, data.email);
   assert.equal(selected?.name, undefined);
   console.log("factory model/field/date/selection transformations: passed");
+
+  for (const id of ["page-a", "page-b"]) {
+    await adapter.create({ model: "user", data: { ...data, id, email: `${id}@example.com`, name: "Cursor" }, forceAllowId: true });
+  }
+  const paginator = createDynamoDBPaginator({ tableName, client: client as never });
+  const request = {
+    model: "app_user",
+    where: [{ field: "name", value: "Cursor", operator: "eq" as const, mode: "sensitive" as const }],
+    limit: 1,
+    select: ["id", "email_address"]
+  };
+  const first = await paginator.findPage(request);
+  assert.deepEqual(first.items, [{ id: "page-a", email_address: "page-a@example.com" }]);
+  assert.ok(first.nextCursor);
+  const second = await paginator.findPage({ ...request, cursor: first.nextCursor });
+  assert.deepEqual(second.items, [{ id: "page-b", email_address: "page-b@example.com" }]);
+  if (second.nextCursor) assert.deepEqual(await paginator.findPage({ ...request, cursor: second.nextCursor }), { items: [], nextCursor: null });
+  console.log("cursor companion / storage mappings / page boundaries: passed");
 
   if (process.argv.includes("--transactions")) {
     commands.length = 0;

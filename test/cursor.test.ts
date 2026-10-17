@@ -59,6 +59,17 @@ describe("public cursor paginator", () => {
     expect((await createDynamoDBPaginator({ ...options, ttl: {} }).findPage(request)).items).toEqual([]);
   });
 
+  it("uses scalar equality beside an id IN residual without fan-out", async () => {
+    const { send, paginator } = harness();
+    const rows = ["a", "b"].map((id) => toStoredItem("user", { id, group: "a" }));
+    const sidecars = rows.flatMap((row) => toIndexSidecars("user", row.entity).filter((sidecar) => sidecar.indexField === "group"));
+    send.mockImplementation(async (command: any) => command instanceof QueryCommand ? { Items: sidecars } : { Item: rows.find((row) => row.sk === command.input.Key.sk) });
+    const where: CleanedWhere[] = [{ ...eq("id", ["b"]), operator: "in" }, ...base.where];
+    expect(await paginator.findPage({ ...base, where, limit: 10 })).toEqual({ items: [{ id: "b", group: "a" }], nextCursor: null });
+    expect(send.mock.calls.filter(([command]) => command instanceof QueryCommand)).toHaveLength(1);
+    expect(send.mock.calls[0]![0].input.ExpressionAttributeValues).toEqual({ ":pk": key.pk });
+  });
+
   it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid limit %s before reads", async (limit) => {
     const { send, paginator } = harness();
     await expect(paginator.findPage({ ...base, limit })).rejects.toThrow(DynamoDBAdapterError);

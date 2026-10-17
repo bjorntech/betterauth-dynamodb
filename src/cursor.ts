@@ -40,10 +40,11 @@ function validateSort(sort: DynamoDBPageRequest["sortBy"]): void {
 }
 
 function pageAccess(request: DynamoDBPageRequest): Access {
-  const plan = planQuery(request.where);
-  if (plan.kind === "byId") return { pk: modelPk(request.model), sk: entitySk(String(eqWhere(request.where, "id")!.value)), prefix: "ID#" };
-  if (plan.kind !== "byFieldValue") throw new UnsupportedQueryError("Cursor pagination requires a single id or scalar equality access path; IN fan-out and scans are unsupported.");
-  const clause = firstEquality(request.where)!;
+  planQuery(request.where); // Validate operators and reject incomplete OR/insensitive access paths.
+  const id = eqWhere(request.where, "id");
+  if (id) return { pk: modelPk(request.model), sk: entitySk(String(id.value)), prefix: "ID#" };
+  const clause = firstEquality(request.where);
+  if (!clause) throw new UnsupportedQueryError("Cursor pagination requires a single id or scalar equality access path; IN fan-out and scans are unsupported.");
   return { pk: indexPk(request.model, clause.field, clause.value), prefix: "OWNER#" };
 }
 

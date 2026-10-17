@@ -61,6 +61,7 @@ describe("native key cursor pagination", () => {
     expect(second.nextCursor).not.toBeNull();
     const third = await paginator.findPage({ ...request, cursor: second.nextCursor! });
     expect(third.items).toEqual([{ id: "c" }]);
+    expect(await paginator.findPage({ ...request, limit: 20, where: [{ ...eq("id", ["c"]), operator: "in" }, eq("group", "g")] })).toEqual({ items: [{ id: "c" }], nextCursor: null });
     // Some engines return LEK on an exactly full final page; continue until absent.
     if (third.nextCursor) expect(await paginator.findPage({ ...request, cursor: third.nextCursor })).toEqual({ items: [], nextCursor: null });
     await expect(paginator.findPage({ ...request, where: [eq("group", "other")], cursor: first.nextCursor! })).rejects.toThrow(/query-mismatched/);
