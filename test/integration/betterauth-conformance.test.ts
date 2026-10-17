@@ -17,7 +17,23 @@ const local = await startLocalDynamo();
 const { client: nativeClient, docClient } = local;
 
 const conformance = await testAdapter({
-  adapter: () => dynamoDBAdapter(adapterOptions()),
+  adapter: () => (options) => {
+    const adapter = dynamoDBAdapter(adapterOptions())(options);
+    const transaction = adapter.transaction;
+    // test-utils 1.6.25 mutates the shared adapter with `transaction = undefined`
+    // while building its wrapper, accidentally selecting the factory fallback.
+    // Preserve the real hook so its rollback test actually exercises transactions.
+    // Scoped adapters returned by this hook and all other methods stay unwrapped.
+    return new Proxy(adapter, {
+      get(target, property, receiver) {
+        return property === "transaction" ? transaction : Reflect.get(target, property, receiver);
+      },
+      set(target, property, value, receiver) {
+        if (property === "transaction" && value === undefined) return true;
+        return Reflect.set(target, property, value, receiver);
+      }
+    });
+  },
   runMigrations: () => createTable(nativeClient, tableName),
   onFinish: async () => {
     try { await deleteTable(nativeClient, tableName); } finally { await local.stop(); }

@@ -20,8 +20,7 @@ JS
 bun install --cwd .peer-compat
 ln -s .peer-compat/node_modules node_modules
 bun scripts/test-peer-compat.ts --transactions
-bun run typecheck
-bun run test
+bun run verify
 bun run test:integration:local
 ```
 
@@ -34,18 +33,27 @@ resolved by Node/Bun, rather than trusting the install command.
 
 The smoke launches the repository's pinned local Dynoxide helper with fake
 credentials and an isolated table. It checks the real factory's model/field/date
-and selection transformations. `--transactions` additionally requires one
+and selection transformations, cursor storage mappings and page boundaries.
+`--transactions` additionally requires one
 aggregate transaction commit, transformed callback results, callback-error
 rollback and all-or-nothing unique-conflict rollback; this intentionally fails
 on the original `transaction: false` adapter.
 Without that flag it is also useful for the original baseline. It does not claim
-AWS production compatibility. Run the integration suite too for pagination and
-storage semantics; this smoke does not substitute for cursor-companion tests.
+AWS production compatibility. Run the integration suite too for full pagination,
+cursor and storage semantics.
 
-With version-compatible test fixtures, the original adapter plus the Dynoxide
-infrastructure passes `bun run verify` against exact 1.6.25 (93 unit tests,
-coverage, CRAP and build). Integration passes 272 tests, including all 238
-official conformance cases; one provider-resource test is explicitly skipped.
+The merged callback-transaction and cursor implementation passes `bun run verify`
+against exact 1.6.25 (130 unit tests, coverage, CRAP and build). Integration passes
+286 tests, including the official callback rollback test; one provider-resource
+test is explicitly skipped. The exact-peer smoke with `--transactions` passes.
+
+Test-utils 1.6.25's suite wrapper assigns `adapter.transaction = undefined` to the
+shared adapter while building its wrappers. Unlike 1.7.5, this can accidentally
+exercise the factory's nontransactional fallback. The conformance fixture alone
+protects the captured real transaction hook with a Proxy, ignoring only that
+undefined assignment. Other methods and transaction-scoped adapters are not
+wrapped or replaced. The official rollback test still executes every assertion
+against the real hook; no production code or installed package is patched.
 
 Core 1.6.25's `getAuthTables` drops plugin table-level `indexes` metadata.
 Compound-lock integration tests therefore use an explicit standalone store
@@ -59,5 +67,5 @@ published model is capability-skipped. The provider refresh-family cleanup test
 continues to run on both versions. Native joins enable both version-specific
 configuration spellings. No adapter failures are excluded or masked.
 
-The same compatibility edits pass `bun run verify` and all 273 integration
-tests against the root's exact 1.7.5 peer family, with no skipped tests.
+The merged integration suite with this fixture also passes all 287 tests against
+the root's exact 1.7.5 peer family, with no skipped tests.
