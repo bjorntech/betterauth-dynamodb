@@ -4,11 +4,11 @@ Production-oriented DynamoDB adapter targeting Better Auth `^1.6.25` via the off
 
 ## Status
 
-This package is published on npm as `@bjorntech/betterauth-dynamodb`. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus explicit Docker-backed DynamoDB Local integration suites (including a separate Better Auth adapter conformance test file).
+This package is published on npm as `@bjorntech/betterauth-dynamodb`. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus local Dynoxide integration suites (including a separate Better Auth adapter conformance test file). The pagination and callback-transaction additions described here are unreleased.
 
 Storage compatibility note: the current storage format uses transactionally maintained scalar equality sidecar rows in the base table, delimiter-safe length-prefixed key components, SHA-256 hashes for sidecar/unique-lock values, and hidden internal revision metadata for ABA-safe mutations. Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
 
-Upgrade note: 1.0.1 to 1.1.0 requires no migration when `enforceSchemaUniqueIndexes` remains at its default `false`, and `IN` support requires no migration. For existing records, opting into new schema unique constraints requires a stopped-write audit, duplicate repair, and application-owned lock backfill before all compatible writers restart with enforcement enabled. New empty affected models need no backfill. No migration utility is supplied.
+Upgrade note: cursor pagination and callback transactions do not change persisted entity, scalar-sidecar, unique-lock, revision or TTL formats and require no storage migration. The existing Better Auth `findMany` offset API is unchanged. 1.0.1 to 1.1.0 requires no migration when `enforceSchemaUniqueIndexes` remains at its default `false`, and `IN` support requires no migration. For existing records, opting into new schema unique constraints requires a stopped-write audit, duplicate repair, and application-owned lock backfill before all compatible writers restart with enforcement enabled. New empty affected models need no backfill. No migration utility is supplied.
 
 ## Installation
 
@@ -74,7 +74,81 @@ import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 
 The schema-index option consumes Better Auth's actual table-level `indexes` array (`DBTableIndex[]`) and only acts on entries with `unique: true`; it does not add an alternative schema-definition option. On a new empty table it can be enabled directly. For a populated table, use a maintenance window with writes stopped: audit duplicates, repair them, and complete an application-owned lock backfill before restarting all writers with compatible code and enforcement enabled. This package provides no migration or backfill utility; do not enable it on unbackfilled rows or allow old/incompatible writers to continue. The `UNIQUE2` namespace is stable only while the index name (explicit or derived), ordered field list, and model/field mapping remain unchanged; changing any of those requires backfilling the new namespace, and pre-existing records do not acquire locks automatically. Rollback requires an explicit plan for versioned locks and writers that may have observed the constraint; disabling the option alone does not undo backfill or repair duplicates.
 
-The package also exports `BetterAuthDynamoDBOptions`, `TtlOptions`, `DynamoDBAdapterError`, and `UnsupportedQueryError`.
+Version caveat: Better Auth core 1.6.25 drops plugin table-level `indexes` while
+building its adapter schema. The adapter cannot discover or enforce those absent
+compound declarations through `enforceSchemaUniqueIndexes` on that version;
+1.7.5 exposes them. This does not affect single-field schema uniqueness or manual
+`uniqueFields`. Exact-peer storage tests use explicit compound-index fixtures and
+do not claim 1.6.25 discovery support.
+
+The package also exports `createDynamoDBPaginator`, `BetterAuthDynamoDBOptions`, `TtlOptions`, `CleanedWhere`, `DynamoDBPageRequest`, `DynamoDBPage`, `DynamoDBPaginator`, `DynamoDBAdapterError`, `DynamoDBConflictError`, and `UnsupportedQueryError`.
+
+## Cursor pagination
+
+Better Auth's `findMany` hook has an array return type and offset/limit arguments,
+not a cursor result hook. Use the read-only companion API for explicit cursors;
+ordinary Better Auth `findMany` remains unchanged:
+
+```ts
+import { createDynamoDBPaginator, type DynamoDBPageRequest } from "@bjorntech/betterauth-dynamodb";
+
+const paginator = createDynamoDBPaginator({
+  tableName: "better-auth",
+  client: dynamo,
+  ttl: { fields: { session: "expiresAt", verification: "expiresAt" } }
+});
+const request: DynamoDBPageRequest = {
+  model: "session",
+  where: [{ field: "userId", value: "user-123", operator: "eq", mode: "sensitive" }],
+  limit: 20,
+  sortBy: { field: "key", direction: "asc" }
+};
+
+let cursor: string | undefined;
+do {
+  const page = await paginator.findPage({
+    ...request,
+    ...(cursor ? { cursor } : {})
+  });
+  console.log(page.items);
+  cursor = page.nextCursor ?? undefined;
+} while (cursor);
+```
+
+- Supply exact **storage model/field names**, including your Better Auth name
+  mappings. The companion does not run Better Auth input/output transformations
+  or infer schema metadata. Configure the same TTL options as the writer.
+- Each call issues exactly one strongly consistent DynamoDB `Query` page, then
+  strongly consistent owner gets for scalar sidecars. It requires an id or scalar
+  equality anchor. It never scans, even with `unsafeAllowScan: true`; unanchored
+  queries, OR predicates and IN-only fan-out are unsupported.
+- `limit` is a positive safe integer bounding **evaluated keys**, not matching
+  records. Residual filters, stale/missing owners and logical TTL can yield fewer
+  items—or an empty page—with a non-null `nextCursor`. Continue until the cursor
+  is null; an exactly full last page can require one final empty request.
+  `pageSize` and `maxPages` apply to the existing draining API, not this companion.
+- Omit `sortBy` for ascending order, or use only
+  `{ field: "key", direction: "asc" | "desc" }`. This is DynamoDB's binary order
+  of the existing length-prefixed `ID#s<byteLength>:<id>` or
+  `OWNER#s<byteLength>:<id>` key, **not lexical/numeric id, creation-date or arbitrary
+  entity-field order**. For example, `z` sorts before `aa`. Other cursor sorts fail
+  rather than sorting each page incorrectly. Ordinary bounded `findMany` can
+  still drain its keyed partition and sort in memory; scan-shaped filters require
+  its explicit `unsafeAllowScan` opt-in. Arbitrary scalable sort orders need an
+  application-designed index/storage contract, not a hidden scan.
+- Cursors are versioned base64url JSON containing DynamoDB's `LastEvaluatedKey`
+  and a SHA-256 fingerprint of table, model, ordered typed predicates, direction,
+  projection and TTL configuration. Decoding checks canonical base64url, version,
+  query fingerprint, key shape/partition, length-prefix encoding and key size.
+  Page size may change between requests; other bound query inputs must stay the
+  same. Treat tokens as opaque, but **they are not signed, encrypted or secret**:
+  validation is not authentication or tamper-proofing. Enforce authorization
+  independently; wrap/sign tokens at your application boundary if needed.
+- Continuation uses the key, not a numeric offset: inserts before the boundary
+  are not revisited and do not shift the next page. Inserts after it can appear
+  later. There is no snapshot across requests; updates, deletion and TTL changes
+  can affect later pages. Do not depend on cursor compatibility across future
+  cursor-format versions.
 
 ## Deployment notes
 
@@ -102,29 +176,107 @@ If a needed access pattern has no id or scalar equality predicate, the adapter t
 
 ## Concurrency guarantees and limitations
 
+### Callback transaction usage
+
+Use the Better Auth adapter instance's `transaction` hook and perform every database
+operation through its callback argument:
+
+```ts
+const database = dynamoDBAdapter({ tableName: "better-auth", client: dynamo });
+const adapter = database({ emailAndPassword: { enabled: true } });
+
+await adapter.transaction(async (tx) => {
+  const user = await tx.create({
+    model: "user",
+    data: { name: "Ada", email: "ada@example.com", emailVerified: false }
+  });
+  await tx.create({
+    model: "account",
+    data: { userId: user.id, accountId: user.id, providerId: "credential" }
+  });
+});
+```
+
+Writes are buffered and become durable only after the callback resolves and the
+single DynamoDB transaction succeeds. A callback that throws before commit
+discards its buffered writes; a conditional/validation transaction rejection
+applies none of the writes. A transport failure can leave the outcome unknown
+(all or none), so do not blindly retry: reconcile state and use application-level
+idempotency where needed. Do not send email, call external
+services or mutate unrelated state expecting those effects to roll back. Use the
+scoped `tx`, not a captured outer adapter; outer-adapter writes are independent.
+Keep callbacks short and await every operation. An unsuccessful commit rejects the
+outer `transaction` promise, even if individual buffered operations had resolved.
+
+DynamoDB permits at most **100 physical item actions** and **4 MB aggregate item
+size** per transaction (and 400 KB per item). Entity rows, scalar sidecars, unique
+locks and any read guards all consume this budget, so the maximum number of
+logical Better Auth records is usually far below 100. Oversized transactions are
+rejected, never split into partially committed batches. The adapter's approximate
+JSON-size preflight is conservative for some value types, not an exact AWS
+marshalled-item-size calculation; DynamoDB remains the final size authority.
+
+Compatibility: callbacks that previously ran sequentially because transaction
+support was disabled now commit as a group and can fail at the aggregate limits.
+Review large callbacks before upgrading. Outside a callback, `updateMany` and
+`deleteMany` retain their existing independent, potentially partially successful
+per-record behavior.
+
+Callback restrictions and isolation:
+
+- Use the scoped adapter and await operations. Repeated changes to one record
+  coalesce into one final mutation; reads see the scoped changes. Operations on
+  the same record should be sequential, not concurrent. Nested callbacks are
+  unsupported, and retained scoped adapters reject after the callback closes.
+- Observed entities are guarded by their original hidden revision at commit;
+  absent **id** reads receive non-existence guards. Reads and queries themselves
+  are not a DynamoDB snapshot. Predicate/range results and absent indexed matches
+  are not phantom-guarded: concurrent inserts can change those results without
+  conflicting. Do not use this as an arbitrary SQL serializable transaction.
+  Every observed entity can consume a read guard, including hydrated rows outside
+  the final in-memory window. Normal scan guards and `maxPages` still apply.
+- Inside callbacks, increments coalesce into a revision-guarded final replacement;
+  outside callbacks they retain native numeric `ADD`. A commit-time consume or
+  increment race rejects the **whole callback** rather than retroactively changing
+  an already returned tentative result to `null`. No automatic callback retries
+  are performed.
+- Cross-record unique-lock transfers/swaps that need multiple actions on the same
+  DynamoDB key fail explicitly. Changing a record id in an update is unsupported;
+  delete/create explicitly instead. Reading an expired physical row can cause a
+  commit conflict until TTL cleanup; pre-revision rows reject rather than using
+  unsafe guards. Existing storage migration requirements still apply.
+
+### Individual operations
+
 - `create` transactionally writes the entity row, scalar equality sidecars, and configured uniqueness locks with conditional non-existence checks.
 - `update`, `updateMany`, `delete`, and `deleteMany` transactionally maintain sidecars and uniqueness locks. After the adapter reads and matches a target, the write uses an optimistic condition on the hidden per-entity revision rather than trying to translate arbitrary Better Auth operators into DynamoDB transaction conditions. This rejects stale ABA-shaped writes even if record contents changed away and back between read and mutation.
 - `consumeOne` transactionally deletes the matched entity, sidecars, and uniqueness locks with the same revision guard. Exactly one concurrent caller can consume a row; normal stale/lost consume races resolve to `null` as Better Auth expects, while non-conditional AWS failures still throw.
-- `incrementOne` uses a DynamoDB transactional `Update` with native numeric `ADD` for numeric/missing counter attributes plus the same revision guard, while maintaining scalar sidecars and uniqueness locks in the same `TransactWriteItems` request. Signed and zero finite deltas are supported; existing non-number counter values follow Better Auth's fallback semantics and are treated as zero with a guarded `SET` instead of invalid DynamoDB `ADD`. The returned row is the updated Better Auth-visible entity computed from the guarded snapshot; if the target guard no longer matches, the operation returns `null`. Unique-lock conflicts or non-conditional AWS failures still throw.
+- Outside callback transactions, `incrementOne` uses a DynamoDB transactional `Update` with native numeric `ADD` for numeric/missing counter attributes plus the same revision guard, while maintaining scalar sidecars and uniqueness locks in the same `TransactWriteItems` request. Signed and zero finite deltas are supported; existing non-number counter values follow Better Auth's fallback semantics and are treated as zero with a guarded `SET` instead of invalid DynamoDB `ADD`. The returned row is the updated Better Auth-visible entity computed from the guarded snapshot; if the target guard no longer matches, the operation returns `null`. Unique-lock conflicts or non-conditional AWS failures still throw.
 - Transactional writes include a fresh AWS `ClientRequestToken` per command construction. This gives AWS SDK/internal network retries of that single send a stable token, but it is not cross-invocation or application-level idempotency.
 - DynamoDB `TransactWriteItems` is limited to 100 actions. The adapter de-duplicates configured unique-field lists, validates that a transaction contains at most one action per item key, rejects serialized transaction requests over approximately 4 MB, and fails early with an actionable error if entity + sidecars + unique locks for a mutation would exceed either limit.
-- Better Auth callback transactions are unsupported because DynamoDB has no interactive transaction API; the adapter reports `transaction: false`. DynamoDB `TransactWriteItems` is single-shot and is used internally for single-record atomic operations.
+- Better Auth callback transactions buffer database writes and use a single-shot DynamoDB `TransactWriteItems` commit. This is not an interactive DynamoDB transaction or an arbitrary SQL isolation guarantee; see the callback transaction restrictions above.
 - Queries without `id` equality or scalar equality require `unsafeAllowScan: true`; this avoids accidental full-table/model draining. Queries containing `OR` predicates, or equality clauses with `mode: "insensitive"` and no other safe keyed equality, also require explicit unsafe scans. `updateMany`, `deleteMany`, and `count` obey the same guard.
 - Base entity gets, sidecar queries, owner gets, and explicit unsafe scans request `ConsistentRead: true`. Strongly consistent reads cost more RCUs than eventually consistent reads. DynamoDB still does not provide a whole-operation snapshot for a paginated scan, so explicit unsafe scans can observe changes between pages.
 - Scalar equality queries use paginated base-table `Query` calls on the sidecar partition, then retrieve owner entity rows and apply residual `where`, sorting, offset, limit, and count in memory. Explicit unsafe scans are also paginated before in-memory filtering/windowing. Keep high-cardinality equality partitions and scan-enabled workloads bounded, and tune `maxPages` for your data shape; if the page cap is reached before `LastEvaluatedKey` clears, the adapter throws instead of returning a partial result. `pageSize` can force smaller Query/Scan pages when you intentionally want more, smaller requests.
 - Scalar `IN` predicates on `id` or a scalar field use one keyed lookup per distinct candidate value, issued sequentially so the shared page budget stays deterministic; a 1,000-value `IN` therefore costs roughly 1,000 sequential DynamoDB round-trips before owner reads. Keep `IN` lists small in latency-sensitive paths. Empty lists are no-ops; duplicate values are removed; more than 1,000 distinct values are rejected before reads. Sidecar queries share one global `maxPages` budget, owner reads are bounded by `maxBulkConcurrency`, and residual filters run before global sorting, offset, and limit windowing. Case-insensitive `IN` cannot use exact-case indexes as a complete access path: it requires an independent safe equality anchor or explicit `unsafeAllowScan: true`; with an anchor it is evaluated as a residual predicate. Case-insensitive `IN`/`not_in` comparisons normalize array members.
 - `updateMany` and `deleteMany` use bounded concurrency (controlled by `maxBulkConcurrency`, default `8`) and one revision-protected transaction per matched record. On failure they stop claiming new records and wait for started workers; earlier commits are not rolled back. They return numeric affected counts and are not aggregate-atomic or safe for blind retries. Each transaction has a 100-action and approximate JSON/practical byte-size preflight; AWS remains the ultimate size authority.
 - Joins use Better Auth's fallback behavior by default: Better Auth performs separate `findOne`/`findMany` calls, which remain subject to this adapter's no-hidden-scan policy. Better Auth's native-join path (`advanced.database.joins` on 1.7.x, `experimental.joins` on 1.6.x) is not supported because DynamoDB cannot honestly join arbitrary Better Auth models without explicit access-pattern design; if enabled and Better Auth passes a native join to the adapter, the adapter throws `UnsupportedQueryError` with instructions to disable the option.
-- The local integration suite uses AWS's official `amazon/dynamodb-local:2.6.1` image through Testcontainers. It proves command behavior against a real DynamoDB API surface for table keys, conditional transactions, sidecar/unique-lock persistence, logical TTL filtering, pagination tokens, and injected clients. The separate `test/integration/betterauth-conformance.test.ts` also runs Better Auth's adapter conformance suites and enables `unsafeAllowScan` because the canonical suites intentionally exercise scan-shaped predicates; production defaults still reject those shapes unless explicitly opted in. These tests do not prove IAM, global tables, streams, PITR/backups, encryption, adaptive capacity, throttling behavior, CloudWatch metrics, real service TTL deletion timing, or every production transaction-conflict edge; validate those in AWS for production-critical rollouts.
+- The local integration suite uses pinned Dynoxide 1.3.0, installed as a development dependency. It tests DynamoDB API behavior for table keys, conditional transactions, sidecar/unique-lock persistence, logical TTL filtering, pagination tokens, and injected clients. The separate `test/integration/betterauth-conformance.test.ts` also runs Better Auth's adapter conformance suites and enables `unsafeAllowScan` because the canonical suites intentionally exercise scan-shaped predicates; production defaults still reject those shapes unless explicitly opted in. These emulator tests do not prove IAM, global tables, streams, PITR/backups, encryption, adaptive capacity, throttling behavior, CloudWatch metrics, real service TTL deletion timing, or every production transaction-conflict edge; validate those in AWS for production-critical rollouts.
 
 ## Verification, coverage, and CRAP policy
 
 ```sh
+bun install --frozen-lockfile
 bun run verify
 bun run test:integration:local
 ```
 
-`bun run verify` runs typecheck, ESLint, coverage tests, CRAP check, and build. The package is tested against Better Auth 1.7.5 and requires Better Auth `^1.6.25` as a peer dependency. `bun run test:integration:local` starts DynamoDB Local in Docker using a random mapped port, fake credentials, in-memory shared DB mode, telemetry disabled, and isolated tables for the local integration and separate adapter conformance suites.
+`bun run verify` runs typecheck, ESLint, coverage tests, CRAP check, and build. The lockfile tests against Better Auth 1.7.5; the peer dependency remains `^1.6.25`. `bun run test:integration:local` starts local [Dynoxide](https://dynoxide.dev/) processes in memory, bound only to loopback on available ports, with fake credentials and isolated tables. Keep optional platform dependencies enabled during installation. Docker and Java are not required. To start a manual development server, use `bun run dynamo:local --port 8000`; automated tests own their own server lifecycle.
+
+For an isolated exact-1.6.25 runtime check without rewriting the root lockfile, see
+[the peer compatibility workflow](./scripts/PEER-COMPAT.md). Final results and
+version-specific test limitations are recorded in
+[the implementation report](./reports/pagination-transactions.md).
 
 Provider coverage uses the published `@better-auth/oauth-provider` 1.7.5 plugin schema and direct query-shape tests, plus ordinary Better Auth HTTP authentication flows. It does not include the provider's full OAuth endpoint surface.
 
@@ -143,6 +295,7 @@ The verification command fails if any implementation function has CRAP `> 6`. Do
 - `bun run test`
 - `bun run test:coverage`
 - `bun run test:integration:local`
+- `bun run dynamo:local --port 8000`
 - `bun run quality:crap`
 - `bun run build`
 - `bun run smoke:dist-import`

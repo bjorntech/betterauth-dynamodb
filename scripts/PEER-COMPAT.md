@@ -34,12 +34,11 @@ resolved by Node/Bun, rather than trusting the install command.
 The smoke launches the repository's pinned local Dynoxide helper with fake
 credentials and an isolated table. It checks the real factory's model/field/date
 and selection transformations, cursor storage mappings and page boundaries.
-`--transactions` additionally requires one
-aggregate transaction commit, transformed callback results, callback-error
-rollback and all-or-nothing unique-conflict rollback; this intentionally fails
-on the original `transaction: false` adapter.
-Without that flag it is also useful for the original baseline. It does not claim
-AWS production compatibility. Run the integration suite too for full pagination,
+`--transactions` additionally requires one aggregate transaction commit,
+transformed callback results, callback-error rollback and all-or-nothing
+unique-conflict rollback. It rejects nontransactional fallback behavior rather
+than merely checking that a callback method exists. It does not claim AWS
+production compatibility. Run the integration suite too for full pagination,
 cursor and storage semantics.
 
 The merged callback-transaction and cursor implementation passes `bun run verify`

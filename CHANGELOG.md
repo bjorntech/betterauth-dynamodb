@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Cursor-based pagination with validated, query-bound continuation tokens and native DynamoDB key ordering; existing Better Auth offset-based `findMany` behavior remains available.
+- Multi-record callback transactions through Better Auth's adapter transaction hook, with buffered writes committed atomically in one DynamoDB transaction.
+- Local Dynoxide-backed integration coverage for pagination, transaction rollback and Better Auth's official adapter test suites.
+
+### Compatibility
+
+- Entity, sidecar, unique-lock and revision storage formats remain unchanged. DynamoDB's 100-action and 4 MB transaction limits apply to physical entity/index/lock actions, not just logical Better Auth records. See README for cursor ordering and callback transaction isolation limits.
+
 ## [1.1.0] - 2026-09-19
 
 ### Added
