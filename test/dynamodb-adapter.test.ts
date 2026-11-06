@@ -55,7 +55,7 @@ describe("DynamoDBStore", () => {
     expect(puts).toEqual(expect.arrayContaining([expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1"), ttl: 1924992000 }), expect.objectContaining({ pk: uniquePk("session", "email"), sk: valueSk("a@example.com", ""), ttl: 1924992000 })]));
     const keys = command.input.TransactItems?.map((item) => `${item.Put?.Item?.pk ?? item.Delete?.Key?.pk ?? item.Update?.Key?.pk}\u0000${item.Put?.Item?.sk ?? item.Delete?.Key?.sk ?? item.Update?.Key?.sk}`) ?? [];
     expect(new Set(keys).size).toBe(keys.length);
-    expect(updates.every((update) => update.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
+    expect(command.input.TransactItems?.every((item) => item.Put?.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
   });
 
   it("shortens and removes retained sidecar TTL metadata atomically", async () => {
