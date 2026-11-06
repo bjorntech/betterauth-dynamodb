@@ -9,8 +9,8 @@ import {
 import { randomUUID } from "node:crypto";
 import { createDocumentClient, normalizeOptions } from "./client.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, redactedAwsError, transactionCancellationCodes } from "./errors.js";
-import { entitySk, indexPk, modelPk } from "./keys.js";
-import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
+import { entitySk, indexPk, listablePk, modelPk } from "./keys.js";
+import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toListableMembership, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
 import type { CleanedWhere, DynamoDBStoreOptions, PlannerHints, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
 import { eqWhere, inWhere, isIndexedField, matchesWhere, mostSelectiveEquality, planQuery, safeInWhere, scalarValues } from "./where.js";
 
@@ -118,7 +118,7 @@ export class DynamoDBStore {
 
   private plannerHints(model: string): PlannerHints {
     const indexedFields = this.options.indexedFields?.[model];
-    return { uniqueFields: this.options.uniqueFields?.[model] ?? [], lowCardinalityFields: this.options.lowCardinalityFields?.[model] ?? [], nonIndexedFields: this.options.nonIndexedFields?.[model] ?? [], ...(indexedFields ? { indexedFields } : {}) };
+    return { uniqueFields: this.options.uniqueFields?.[model] ?? [], lowCardinalityFields: this.options.lowCardinalityFields?.[model] ?? [], nonIndexedFields: this.options.nonIndexedFields?.[model] ?? [], ...(this.options.listableModels?.includes(model) ? { listableModel: true } : {}), ...(indexedFields ? { indexedFields } : {}) };
   }
 
   private async targetByWhere(model: string, where: CleanedWhere[]): Promise<StoredItem | null> {
@@ -141,7 +141,7 @@ export class DynamoDBStore {
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
     if (plan.kind === "byFieldValue") return this.loadByField(model, plan);
     if (plan.kind === "byFieldValues") return this.loadByFields(model, plan.where);
-    return this.scanModel(model);
+    return this.options.listableModels?.includes(model) ? this.loadListableModel(model) : this.scanModel(model);
   }
 
   private async loadById(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
@@ -155,6 +155,12 @@ export class DynamoDBStore {
     if (!clause) return [];
     const sidecars = await this.queryAllSidecars(model, clause);
     return this.loadOwners(sidecars, clause);
+  }
+
+  private async loadListableModel(model: string): Promise<StoredItem[]> {
+    const command = listableQuery(this.options.tableName, model, this.options.pageSize);
+    const members = await drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
+    return this.loadOwners(members);
   }
 
   private async scanModel(model: string): Promise<StoredItem[]> {
@@ -217,9 +223,9 @@ export class DynamoDBStore {
     return drainPages<StoredItem>(async (key) => pageOf<StoredItem>(await this.client.send(new ScanCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
   }
 
-  private async loadOwners(sidecars: SidecarItem[], clause: CleanedWhere): Promise<StoredItem[]> {
+  private async loadOwners(sidecars: SidecarItem[], clause?: CleanedWhere): Promise<StoredItem[]> {
     const rows = await mapBounded(sidecars, this.options.maxBulkConcurrency, (item) => this.loadOwner(item));
-    return rows.filter((row): row is StoredItem => row !== null && matchesWhere(row, [clause]));
+    return rows.filter((row): row is StoredItem => row !== null && (!clause || matchesWhere(row, [clause])));
   }
 
   private async loadOwner(sidecar: SidecarItem): Promise<StoredItem | null> {
@@ -247,7 +253,8 @@ export class DynamoDBStore {
   }
 
   private allSidecars(model: string, data: Record<string, unknown>): SidecarItem[] {
-    return [...this.sidecars(model, data), ...this.uniqueLocks(model, data), ...toSchemaUniqueLocks(model, data, (this.options.schemaUniqueIndexes ?? []).filter((index) => index.model === model), this.options.ttl)];
+    const membership = this.options.listableModels?.includes(model) ? [toListableMembership(model, data, this.options.ttl)] : [];
+    return [...this.sidecars(model, data), ...this.uniqueLocks(model, data), ...toSchemaUniqueLocks(model, data, (this.options.schemaUniqueIndexes ?? []).filter((index) => index.model === model), this.options.ttl), ...membership];
   }
 
   private async loadByIds(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
@@ -519,6 +526,10 @@ function consumePageBudget(page: number, maxPages: number, budget?: { remaining:
 
 function sidecarQuery(tableName: string, model: string, clause: CleanedWhere, pageSize?: number) {
   return withPageSize({ TableName: tableName, ConsistentRead: true, KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)", ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" }, ExpressionAttributeValues: { ":pk": indexPk(model, clause.field, clause.value), ":sk": "OWNER#" } }, pageSize);
+}
+
+function listableQuery(tableName: string, model: string, pageSize?: number) {
+  return withPageSize({ TableName: tableName, ConsistentRead: true, KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)", ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" }, ExpressionAttributeValues: { ":pk": listablePk(model), ":sk": "MEMBER#" } }, pageSize);
 }
 
 function modelScan(tableName: string, model: string, pageSize?: number) {

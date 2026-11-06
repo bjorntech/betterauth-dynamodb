@@ -40,6 +40,8 @@ export interface BetterAuthDynamoDBOptions {
    * Set `false` on new tables, or once existing rows have been rewritten or cleaned up.
    */
   cleanupNonIndexedSidecars?: boolean;
+  /** Models with a small global membership set that may be listed without a table scan. */
+  listableModels?: string[];
 }
 
 /** Store options: public adapter options plus schema metadata resolved and validated by the adapter factory. */
@@ -104,4 +106,5 @@ export interface PlannerHints {
   /** When set, only these fields have sidecars. */
   indexedFields?: readonly string[];
   nonIndexedFields?: readonly string[];
+  listableModel?: boolean;
 }

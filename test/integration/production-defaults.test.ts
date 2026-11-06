@@ -1,10 +1,11 @@
 import { CreateTableCommand, DynamoDBClient, ListTablesCommand } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
 import { emailOTP } from "better-auth/plugins/email-otp";
+import { jwt } from "better-auth/plugins/jwt";
 import { dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 
@@ -159,10 +160,32 @@ describe("Better Auth core flows under production defaults", () => {
     expect(first.status).toBe(200);
     expect((await auth.handler(post("/api/auth/sign-in/email-otp", { email: "otp@example.com", otp }))).status).toBe(400);
   });
+
+  it("supports JWT session headers and JWKS without a table Scan", async () => {
+    const auth = createAuth({ plugins: [jwt()] });
+    const originalSend = docClient.send.bind(docClient);
+    const send = vi.spyOn(docClient, "send").mockImplementation(async (command) => {
+      if (command instanceof ScanCommand) throw new Error("unexpected DynamoDB Scan");
+      return originalSend(command as never) as never;
+    });
+    try {
+      expect((await auth.handler(post("/api/auth/sign-up/email", { email: "jwt@example.com", password: "password-123", name: "JWT" }))).status).toBe(200);
+      const cookie = await signIn(auth, "jwt@example.com", "password-123");
+      const session = await auth.handler(get("/api/auth/get-session", cookie));
+      expect(session.status).toBe(200);
+      expect(session.headers.get("set-auth-jwt")).toEqual(expect.any(String));
+      const jwks = await auth.handler(new Request(`${BASE_URL}/api/auth/jwks`));
+      expect(jwks.status).toBe(200);
+      expect((await jwks.json()).keys).toHaveLength(1);
+      expect(send.mock.calls.some(([command]) => command instanceof ScanCommand)).toBe(false);
+    } finally {
+      send.mockRestore();
+    }
+  });
 });
 
 function createAuth(overrides: Record<string, unknown> = {}) {
-  const adapterOptions: BetterAuthDynamoDBOptions = { tableName, client: docClient, ttl: { fields: { session: "expiresAt", verification: "expiresAt" } }, indexedFields: CORE_INDEXED_FIELDS, cleanupNonIndexedSidecars: false, pageSize: 2, maxPages: 3 };
+  const adapterOptions: BetterAuthDynamoDBOptions = { tableName, client: docClient, ttl: { fields: { session: "expiresAt", verification: "expiresAt", jwks: "expiresAt" } }, indexedFields: CORE_INDEXED_FIELDS, listableModels: ["jwks", "oauthResource"], cleanupNonIndexedSidecars: false, pageSize: 2, maxPages: 3 };
   return betterAuth({
     secret: "test-secret-that-is-long-enough-for-better-auth",
     baseURL: BASE_URL,

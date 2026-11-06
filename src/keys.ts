@@ -8,6 +8,15 @@ export function modelPk(model: string): string {
   return checkedPartitionKey(`MODEL${SEP}${component(model)}`, "model partition key");
 }
 
+/** Partition containing membership rows for an opt-in small, globally-listable model. */
+export function listablePk(model: string): string {
+  return checkedPartitionKey(`LIST${SEP}${component(model)}`, "listable model partition key");
+}
+
+export function listableSk(id: string): string {
+  return checkedSortKey(`MEMBER${SEP}${component(id)}`, "listable model member sort key");
+}
+
 export function entitySk(id: string): string {
   return checkedSortKey(`ID${SEP}${component(id)}`, "entity sort key");
 }
