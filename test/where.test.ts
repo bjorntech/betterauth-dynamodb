@@ -11,6 +11,12 @@ describe("where planning and matching", () => {
     expect(planQuery([clause("email", "eq", "a")]).kind).toBe("byFieldValue");
   });
 
+  it("plans unanchored predicates through a configured listable model", () => {
+    expect(planQuery([], false, { listableModel: true }).kind).toBe("byModel");
+    expect(planQuery([clause("kid", "eq", "k1")], false, { listableModel: true, indexedFields: [] }).kind).toBe("byModel");
+    expect(planQuery([clause("kid", "eq", "k1"), clause("role", "eq", "admin", { connector: "OR" })], false, { listableModel: true }).kind).toBe("byModel");
+  });
+
   it("plans scalar and id IN predicates without scans, including empty IN", () => {
     expect(planQuery([clause("id", "in", ["u1", "u1", "u2"])]).kind).toBe("byIdValues");
     expect(planQuery([clause("email", "in", ["a@example.com", "b@example.com"])]).kind).toBe("byFieldValues");

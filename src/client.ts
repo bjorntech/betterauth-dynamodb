@@ -15,9 +15,10 @@ export function createDocumentClient(options: BetterAuthDynamoDBOptions): Dynamo
 
 export function normalizeOptions<O extends BetterAuthDynamoDBOptions>(options: O): Required<Pick<BetterAuthDynamoDBOptions, "maxPages" | "unsafeAllowScan" | "maxBulkConcurrency">> & O {
   const uniqueFields = dedupeUniqueFields(options.uniqueFields);
+  const listableModels = options.listableModels ? [...new Set(options.listableModels)] : undefined;
   const pageSize = optionalPositiveSafeIntegerOption("pageSize", options.pageSize);
   const maxBulkConcurrency = positiveSafeIntegerOption("maxBulkConcurrency", options.maxBulkConcurrency, 8);
-  return { ...options, ...(uniqueFields ? { uniqueFields } : {}), ...(pageSize ? { pageSize } : {}), maxPages: positiveSafeIntegerOption("maxPages", options.maxPages, 25), unsafeAllowScan: options.unsafeAllowScan ?? false, maxBulkConcurrency };
+  return { ...options, ...(uniqueFields ? { uniqueFields } : {}), ...(listableModels ? { listableModels } : {}), ...(pageSize ? { pageSize } : {}), maxPages: positiveSafeIntegerOption("maxPages", options.maxPages, 25), unsafeAllowScan: options.unsafeAllowScan ?? false, maxBulkConcurrency };
 }
 
 function positiveSafeIntegerOption(name: string, value: number | undefined, defaultValue: number): number {

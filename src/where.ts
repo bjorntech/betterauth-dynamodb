@@ -6,11 +6,17 @@ type WhereOperator = CleanedWhere["operator"];
 export function planQuery(where: CleanedWhere[] = [], allowScan = false, hints: PlannerHints = {}): QueryPlan {
   assertSupportedOperators(where);
   const keyedProblem = keyedAccessProblem(where, hints);
-  if (keyedProblem) return scanOrThrow(where, allowScan, keyedProblem);
+  if (keyedProblem) return scanOrListable(where, allowScan, hints, keyedProblem);
   const keyed = keyedPlan(where, hints);
   if (keyed) return keyed;
+  if (hints.listableModel) return { kind: "byModel", where };
   if (allowScan) return { kind: "byModel", where };
   throw new UnsupportedQueryError(scanRequiredMessage(where, hints));
+}
+
+function scanOrListable(where: CleanedWhere[], allowScan: boolean, hints: PlannerHints, message: string): QueryPlan {
+  if (hints.listableModel) return { kind: "byModel", where };
+  return scanOrThrow(where, allowScan, message);
 }
 
 /** `id` is the entity key; other fields are sidecar-indexed unless excluded or outside a configured allowlist. */

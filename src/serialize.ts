@@ -1,4 +1,4 @@
-import { compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "./keys.js";
+import { compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, listablePk, listableSk, modelPk, uniquePk, valueSk } from "./keys.js";
 import type { SchemaUniqueIndex, SidecarItem, StoredItem, TtlOptions } from "./types.js";
 import { randomUUID } from "node:crypto";
 
@@ -44,6 +44,14 @@ export function toSchemaUniqueLocks(model: string, data: Record<string, unknown>
   const id = requireId(data);
   const ttlValue = deriveTtl(model, data, ttl);
   return indexes.flatMap((index) => schemaUniqueLockItem(model, id, data, index, ttlValue, ttl));
+}
+
+export function toListableMembership(model: string, data: Record<string, unknown>, ttl?: false | TtlOptions): SidecarItem {
+  const id = requireId(data);
+  const item: SidecarItem = { pk: listablePk(model), sk: listableSk(id), model: `_listable_${model}`, id, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id) }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
+  const ttlValue = deriveTtl(model, data, ttl);
+  if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
+  return item;
 }
 
 function schemaUniqueLockItem(model: string, id: string, data: Record<string, unknown>, index: SchemaUniqueIndex, ttlValue: number | undefined, ttl?: false | TtlOptions): SidecarItem[] {

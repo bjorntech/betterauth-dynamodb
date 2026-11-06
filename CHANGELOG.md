@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Adds opt-in `listableModels` membership partitions for scan-free global model listings, including Better Auth JWT `jwks` and OAuth-provider `oauthResource` access patterns.
+
 ## [1.2.0] - 2026-11-06
 
 ### Tests

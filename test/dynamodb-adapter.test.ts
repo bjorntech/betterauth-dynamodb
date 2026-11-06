@@ -3,7 +3,7 @@ import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aw
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBStore } from "../src/dynamodb-adapter.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "../src/errors.js";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../src/keys.js";
+import { entitySk, indexPk, indexSk, listablePk, listableSk, modelPk, uniquePk, valueSk } from "../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../src/serialize.js";
 import type { CleanedWhere } from "../src/types.js";
 
@@ -32,6 +32,67 @@ describe("DynamoDBStore", () => {
     expect(puts).toContainEqual(expect.objectContaining({ pk: indexPk("session", "userId", "u1"), sk: indexSk("s1"), ttl: 1893456000 }));
     expect(command.input.ClientRequestToken).toMatch(/^[0-9a-f-]{36}$/);
     expect(command.input.TransactItems?.every((item) => item.Put?.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
+  });
+
+  it("uses a listable membership Query instead of Scan and maintains it transactionally", async () => {
+    const doc = client();
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], ttl: { defaultField: "expiresAt" } });
+    await store.create("jwks", { id: "k1", key: "public", expiresAt: "2030-01-01T00:00:00.000Z" });
+    const create = doc.send.mock.calls[0]?.[0] as TransactWriteCommand;
+    expect(create.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: listablePk("jwks"), sk: listableSk("k1"), ttl: 1893456000 }) }) }));
+
+    const member = { pk: listablePk("jwks"), sk: listableSk("k1"), ownerPk: modelPk("jwks"), ownerSk: entitySk("k1"), entity: { ownerPk: modelPk("jwks"), ownerSk: entitySk("k1") } };
+    const owner = { pk: modelPk("jwks"), sk: entitySk("k1"), id: "k1", key: "public", entity: { id: "k1", key: "public" }, ...rev };
+    doc.send.mockImplementation(async (command) => command instanceof QueryCommand ? { Items: [member] } : command instanceof GetCommand ? { Item: owner } : {});
+    await expect(store.findMany("jwks", [], 10)).resolves.toEqual([{ id: "k1", key: "public" }]);
+    expect(doc.send.mock.calls.some(([command]) => command instanceof ScanCommand)).toBe(false);
+    expect((doc.send.mock.calls.find(([command]) => command instanceof QueryCommand)?.[0] as QueryCommand).input.ExpressionAttributeValues?.[":pk"]).toBe(listablePk("jwks"));
+  });
+
+  it("maintains listable membership across id changes, increments, expiry, consumption, and deletes", async () => {
+    const row = { pk: modelPk("jwks"), sk: entitySk("k1"), model: "jwks", id: "k1", hits: 1, expiresAt: "2030-01-01T00:00:00.000Z", entity: { id: "k1", hits: 1, expiresAt: "2030-01-01T00:00:00.000Z" }, ...rev };
+    const doc = client([row]);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], ttl: { defaultField: "expiresAt" } });
+    const membership = (id: string) => ({ pk: listablePk("jwks"), sk: listableSk(id), ownerPk: modelPk("jwks"), ownerSk: entitySk(id) });
+    const actions = () => (doc.send.mock.calls.at(-1)?.[0] as TransactWriteCommand).input.TransactItems ?? [];
+
+    await store.update("jwks", [eq("id", "k1")], { id: "k1-renamed", expiresAt: "2031-01-01T00:00:00.000Z" });
+    expect(actions()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: listablePk("jwks"), sk: listableSk("k1") } }) }),
+      expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ ...membership("k1-renamed"), ttl: 1924992000 }) }) })
+    ]));
+
+    doc.send.mockClear();
+    doc.send.mockImplementation(async (command) => command instanceof GetCommand ? { Item: { ...row, pk: modelPk("jwks"), sk: entitySk("k1-renamed"), id: "k1-renamed", hits: 1, entity: { id: "k1-renamed", hits: 1, expiresAt: "2031-01-01T00:00:00.000Z" } } } : {});
+    await store.incrementOne("jwks", [eq("id", "k1-renamed")], { hits: 1 });
+    expect(actions()).toEqual(expect.arrayContaining([expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining(membership("k1-renamed")) }) })]));
+
+    doc.send.mockClear();
+    await store.consumeOne("jwks", [eq("id", "k1-renamed")]);
+    expect(actions()).toEqual(expect.arrayContaining([expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: listablePk("jwks"), sk: listableSk("k1-renamed") } }) })]));
+
+    doc.send.mockClear();
+    await store.delete("jwks", [eq("id", "k1-renamed")]);
+    expect(actions()).toEqual(expect.arrayContaining([expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: listablePk("jwks"), sk: listableSk("k1-renamed") } }) })]));
+  });
+
+  it("paginates listable membership queries and enforces maxPages", async () => {
+    const members = ["k1", "k2", "k3"].map((id) => ({ pk: listablePk("jwks"), sk: listableSk(id), ownerPk: modelPk("jwks"), ownerSk: entitySk(id), entity: {} }));
+    const owners = new Map(members.map((member, index) => [member.ownerSk, { pk: member.ownerPk, sk: member.ownerSk, id: `k${index + 1}`, model: "jwks", entity: { id: `k${index + 1}` }, ...rev }]));
+    let page = 0;
+    const doc = client();
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof QueryCommand) { const member = members[page++]; return { Items: member ? [member] : [], ...(page < members.length ? { LastEvaluatedKey: member } : {}) }; }
+      if (command instanceof GetCommand) return { Item: owners.get(String(command.input.Key?.sk)) };
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], pageSize: 1, maxPages: 3 });
+    await expect(store.findMany("jwks", [], 10)).resolves.toHaveLength(3);
+    expect(doc.send.mock.calls.filter(([command]) => command instanceof QueryCommand)).toHaveLength(3);
+
+    page = 0;
+    const limited = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], pageSize: 1, maxPages: 2 });
+    await expect(limited.findMany("jwks", [], 10)).rejects.toThrow(/exceeded maxPages/);
   });
 
   it("strips top-level and nested undefined values before command construction", async () => {
