@@ -390,7 +390,7 @@ describe("DynamoDB Local adapter integration", () => {
   });
 
   it("does not store plaintext schema tuples and rewrites legacy sidecars and locks", async () => {
-    const adapter = schemaIndexAdapter(true);
+    const adapter = dynamoDBAdapter({ tableName, client: docClient, enforceSchemaUniqueIndexes: true, uniqueFields: { oauthClientResource: ["clientId"] } } as never)(schemaAuthOptions() as never) as TestAdapter;
     await create(adapter, "oauthClientResource", { id: "legacy-redact", clientId: "client-redact", resourceId: "resource-redact" });
     const ownerPk = modelPk("oauthClientResource");
     const ownerSk = entitySk("legacy-redact");
