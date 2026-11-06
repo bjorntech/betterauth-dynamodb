@@ -6,9 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-06
+
 ### Added
 
 - Adds opt-in `listableModels` membership partitions for scan-free global model listings, including Better Auth JWT `jwks` and OAuth-provider `oauthResource` access patterns.
+
+### Migration
+
+- For an existing table, enabling `listableModels` does not discover or backfill existing entities. Keep writes stopped for the affected model and run an application-owned, owner-checked transactional membership backfill before enabling the option for all writers. Until that backfill is complete, existing Better Auth JWT keys may be absent from listable queries and the plugin may create a replacement key. New empty models need no backfill.
+
+### Limitations
+
+- Listable membership partitions are intentionally small and single-partition; do not use `listableModels` for high-volume models. Each membership row adds transactional write and storage cost to create, update, increment, consume, and delete operations.
 
 ## [1.2.0] - 2026-11-06
 
@@ -102,7 +112,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
-[Unreleased]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
