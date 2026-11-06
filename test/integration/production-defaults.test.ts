@@ -1,11 +1,12 @@
 import { CreateTableCommand, DynamoDBClient, ListTablesCommand } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import { jwt } from "better-auth/plugins/jwt";
+import { oauthProvider } from "@better-auth/oauth-provider";
 import { dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 
@@ -177,6 +178,42 @@ describe("Better Auth core flows under production defaults", () => {
       const jwks = await auth.handler(new Request(`${BASE_URL}/api/auth/jwks`));
       expect(jwks.status).toBe(200);
       expect((await jwks.json()).keys).toHaveLength(1);
+      expect(send.mock.calls.some(([command]) => command instanceof ScanCommand)).toBe(false);
+    } finally {
+      send.mockRestore();
+    }
+  });
+
+  it("seeds and resolves an OAuth resource through a consistent LIST partition query", async () => {
+    const resource = "https://api.example.com/resource";
+    const auth = createAuth({
+      plugins: [jwt(), oauthProvider({ loginPage: "/login", consentPage: "/consent", resources: [resource], clientRegistrationAllowedResources: [resource], allowDynamicClientRegistration: true, allowUnauthenticatedClientRegistration: true })]
+    });
+    const originalSend = docClient.send.bind(docClient);
+    const send = vi.spyOn(docClient, "send").mockImplementation(async (command) => {
+      if (command instanceof ScanCommand) throw new Error("unexpected DynamoDB Scan");
+      return originalSend(command as never) as never;
+    });
+    try {
+      const registration = await auth.handler(post("/api/auth/oauth2/register", {
+        client_name: "production-defaults-test",
+        redirect_uris: ["https://client.example.com/callback"],
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+        scope: "openid",
+        resources: [resource]
+      }));
+      expect(registration.status).toBe(201);
+      const client = (await registration.json()) as { client_id: string };
+
+      const authorization = await auth.handler(new Request(`${BASE_URL}/api/auth/oauth2/authorize?response_type=code&client_id=${encodeURIComponent(client.client_id)}&redirect_uri=${encodeURIComponent("https://client.example.com/callback")}&scope=openid&resource=${encodeURIComponent(resource)}`));
+      expect(authorization.status).toBe(302);
+
+      const listAdapter = dynamoDBAdapter({ tableName, client: docClient, indexedFields: CORE_INDEXED_FIELDS, listableModels: ["jwks", "oauthResource"], cleanupNonIndexedSidecars: false, pageSize: 2, maxPages: 3 })({ secret: "test-secret-that-is-long-enough-for-better-auth", plugins: [jwt(), oauthProvider({ loginPage: "/login", consentPage: "/consent", resources: [resource] })] } as never) as { findMany: (input: { model: string; limit: number; where?: unknown[] }) => Promise<Record<string, unknown>[]> };
+      await expect(listAdapter.findMany({ model: "oauthResource", where: [], limit: 10 })).resolves.toEqual([expect.objectContaining({ identifier: resource })]);
+      const queries = send.mock.calls.map(([command]) => command).filter((command) => command instanceof QueryCommand) as unknown as QueryCommand[];
+      expect(queries.some((command) => command.input.ConsistentRead === true && String(command.input.ExpressionAttributeValues?.[":pk"]).startsWith("LIST#"))).toBe(true);
       expect(send.mock.calls.some(([command]) => command instanceof ScanCommand)).toBe(false);
     } finally {
       send.mockRestore();

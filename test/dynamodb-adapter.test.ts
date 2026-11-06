@@ -49,6 +49,52 @@ describe("DynamoDBStore", () => {
     expect((doc.send.mock.calls.find(([command]) => command instanceof QueryCommand)?.[0] as QueryCommand).input.ExpressionAttributeValues?.[":pk"]).toBe(listablePk("jwks"));
   });
 
+  it("maintains listable membership across id changes, increments, expiry, consumption, and deletes", async () => {
+    const row = { pk: modelPk("jwks"), sk: entitySk("k1"), model: "jwks", id: "k1", hits: 1, expiresAt: "2030-01-01T00:00:00.000Z", entity: { id: "k1", hits: 1, expiresAt: "2030-01-01T00:00:00.000Z" }, ...rev };
+    const doc = client([row]);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], ttl: { defaultField: "expiresAt" } });
+    const membership = (id: string) => ({ pk: listablePk("jwks"), sk: listableSk(id), ownerPk: modelPk("jwks"), ownerSk: entitySk(id) });
+    const actions = () => (doc.send.mock.calls.at(-1)?.[0] as TransactWriteCommand).input.TransactItems ?? [];
+
+    await store.update("jwks", [eq("id", "k1")], { id: "k1-renamed", expiresAt: "2031-01-01T00:00:00.000Z" });
+    expect(actions()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: listablePk("jwks"), sk: listableSk("k1") } }) }),
+      expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ ...membership("k1-renamed"), ttl: 1924992000 }) }) })
+    ]));
+
+    doc.send.mockClear();
+    doc.send.mockImplementation(async (command) => command instanceof GetCommand ? { Item: { ...row, pk: modelPk("jwks"), sk: entitySk("k1-renamed"), id: "k1-renamed", hits: 1, entity: { id: "k1-renamed", hits: 1, expiresAt: "2031-01-01T00:00:00.000Z" } } } : {});
+    await store.incrementOne("jwks", [eq("id", "k1-renamed")], { hits: 1 });
+    expect(actions()).toEqual(expect.arrayContaining([expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining(membership("k1-renamed")) }) })]));
+
+    doc.send.mockClear();
+    await store.consumeOne("jwks", [eq("id", "k1-renamed")]);
+    expect(actions()).toEqual(expect.arrayContaining([expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: listablePk("jwks"), sk: listableSk("k1-renamed") } }) })]));
+
+    doc.send.mockClear();
+    await store.delete("jwks", [eq("id", "k1-renamed")]);
+    expect(actions()).toEqual(expect.arrayContaining([expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: listablePk("jwks"), sk: listableSk("k1-renamed") } }) })]));
+  });
+
+  it("paginates listable membership queries and enforces maxPages", async () => {
+    const members = ["k1", "k2", "k3"].map((id) => ({ pk: listablePk("jwks"), sk: listableSk(id), ownerPk: modelPk("jwks"), ownerSk: entitySk(id), entity: {} }));
+    const owners = new Map(members.map((member, index) => [member.ownerSk, { pk: member.ownerPk, sk: member.ownerSk, id: `k${index + 1}`, model: "jwks", entity: { id: `k${index + 1}` }, ...rev }]));
+    let page = 0;
+    const doc = client();
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof QueryCommand) { const member = members[page++]; return { Items: member ? [member] : [], ...(page < members.length ? { LastEvaluatedKey: member } : {}) }; }
+      if (command instanceof GetCommand) return { Item: owners.get(String(command.input.Key?.sk)) };
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], pageSize: 1, maxPages: 3 });
+    await expect(store.findMany("jwks", [], 10)).resolves.toHaveLength(3);
+    expect(doc.send.mock.calls.filter(([command]) => command instanceof QueryCommand)).toHaveLength(3);
+
+    page = 0;
+    const limited = new DynamoDBStore({ tableName: "auth", client: doc as never, listableModels: ["jwks"], pageSize: 1, maxPages: 2 });
+    await expect(limited.findMany("jwks", [], 10)).rejects.toThrow(/exceeded maxPages/);
+  });
+
   it("strips top-level and nested undefined values before command construction", async () => {
     const doc = client();
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
