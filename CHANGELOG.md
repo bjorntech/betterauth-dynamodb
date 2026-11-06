@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-06
+
 ### Tests
 
 - Adds production-default Better Auth integration coverage for database-backed rate limiting, email verification, email OTP sign-in, and existing core authentication flows without `unsafeAllowScan`.
@@ -30,6 +32,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Transactional writes no longer request `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`. Nothing in the adapter read the returned items, but AWS attached the full stored row (for example an account's password hash or OAuth tokens) to `TransactionCanceledException.CancellationReasons[].Item`, and `DynamoDBConflictError` carried that exception as `cause`, so logging a conflict could leak secrets.
 - `DynamoDBConflictError.cause` is now a redacted `{ name, message, cancellationCodes }` object instead of the raw AWS exception.
 
+  This is an intentional error API change: callers must use the redacted fields and must not depend on AWS exception internals or stored cancellation items.
+
 ### Added
 
 - Adds Better Auth 1.7.16 compatibility coverage.
@@ -53,7 +57,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Existing sidecar and single-field/schema unique-lock rows may contain plaintext value copies in `indexValue`, `entity.value`, or a value-bearing `id`. Any record mutation rewrites the sidecars and locks it touches atomically into the redacted shape; untouched records retain legacy copies until rewritten or removed. Existing hashed keys are unchanged, so legacy-format reads and uniqueness continue to work during rolling upgrades.
 - For a complete cleanup, stop writes, audit and repair duplicate ownership, then run an application-owned backfill that reads each entity by its `MODEL#/ID#` key, derives the current sidecar/lock keys, and conditionally replaces only rows whose `ownerPk` and `ownerSk` match that entity. Delete retired legacy rows only with the same owner condition; do not scan or delete by plaintext value alone. Resume writes only after the backfill and all writers use this format.
-- SHA-256 keys are unkeyed. Do not index low-entropy secrets: table readers who can observe hashes can perform dictionary/equality inference. No major version bump is required; this is backwards-compatible storage cleanup with an explicit migration path and no release/version bump.
+- SHA-256 keys are unkeyed. Do not index low-entropy secrets: table readers who can observe hashes can perform dictionary/equality inference.
 
 ## [1.1.0] - 2026-09-19
 
@@ -94,7 +98,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
-[Unreleased]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0
