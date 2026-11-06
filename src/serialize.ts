@@ -27,10 +27,11 @@ function newRevision(): string {
   return randomUUID();
 }
 
-export function toIndexSidecars(model: string, data: Record<string, unknown>, ttl?: false | TtlOptions): SidecarItem[] {
+/** Builds equality sidecars for scalar fields accepted by `include` (default: every scalar field). */
+export function toIndexSidecars(model: string, data: Record<string, unknown>, ttl?: false | TtlOptions, include: (field: string) => boolean = () => true): SidecarItem[] {
   const id = requireId(data);
   const ttlValue = deriveTtl(model, data, ttl);
-  return indexEntries(data).map(([field, value]) => sidecarItem(model, id, field, value, ttlValue, ttl));
+  return indexEntries(data).filter(([field]) => include(field)).map(([field, value]) => sidecarItem(model, id, field, value, ttlValue, ttl));
 }
 
 export function toUniqueLocks(model: string, data: Record<string, unknown>, fields: string[], ttl?: false | TtlOptions): SidecarItem[] {
@@ -42,13 +43,15 @@ export function toUniqueLocks(model: string, data: Record<string, unknown>, fiel
 export function toSchemaUniqueLocks(model: string, data: Record<string, unknown>, indexes: SchemaUniqueIndex[], ttl?: false | TtlOptions): SidecarItem[] {
   const id = requireId(data);
   const ttlValue = deriveTtl(model, data, ttl);
-  return indexes.flatMap((index) => {
-    const values = index.fields.map((field) => data[field]);
-    if (values.some((value) => value === undefined || value === null)) return [];
-    const item: SidecarItem = { pk: compoundUniquePk(model, index.name), sk: compoundUniqueSk(values), model: `_unique2_${model}`, id: `${index.name}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), fields: index.fields, values }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
-    if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
-    return [item];
-  });
+  return indexes.flatMap((index) => schemaUniqueLockItem(model, id, data, index, ttlValue, ttl));
+}
+
+function schemaUniqueLockItem(model: string, id: string, data: Record<string, unknown>, index: SchemaUniqueIndex, ttlValue: number | undefined, ttl?: false | TtlOptions): SidecarItem[] {
+  const values = index.fields.map((field) => data[field]);
+  if (values.some((value) => value === undefined || value === null)) return [];
+  const item: SidecarItem = { pk: compoundUniquePk(model, index.name), sk: compoundUniqueSk(values), model: `_unique2_${model}`, id: `${index.name}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), fields: index.fields }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
+  if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
+  return [item];
 }
 
 export function fromStoredItem<T>(item?: Record<string, unknown> | null, ttlOptions?: false | TtlOptions): T | null {
@@ -116,14 +119,14 @@ function indexEntries(data: Record<string, unknown>): [string, unknown][] {
 }
 
 function sidecarItem(model: string, id: string, field: string, value: unknown, ttlValue: number | undefined, ttl?: false | TtlOptions): SidecarItem {
-  const item: SidecarItem = { pk: indexPk(model, field, value), sk: indexSk(id), model: `_index_${model}`, id: `${field}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), field, value }, ownerPk: modelPk(model), ownerSk: entitySk(id), indexModel: model, indexField: field, indexValue: value };
+  const item: SidecarItem = { pk: indexPk(model, field, value), sk: indexSk(id), model: `_index_${model}`, id: `${field}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), field }, ownerPk: modelPk(model), ownerSk: entitySk(id), indexModel: model, indexField: field };
   if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
   return item;
 }
 
 function uniqueLockItem(model: string, id: string, field: string, value: unknown, ttlValue: number | undefined, ttl?: false | TtlOptions): SidecarItem[] {
   if (value === undefined || value === null) return [];
-  const item: SidecarItem = { pk: uniquePk(model, field), sk: valueSk(value, ""), model: `_unique_${model}`, id: `${field}:${String(value)}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), field, value }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
+  const item: SidecarItem = { pk: uniquePk(model, field), sk: valueSk(value, ""), model: `_unique_${model}`, id: `${field}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), field }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
   if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
   return [item];
 }

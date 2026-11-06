@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed (storage format, backwards compatible)
+
+- `id` no longer gets a scalar sidecar: it is the entity key and the planner always reads it with `GetItem`. Creates write one fewer transactional action.
+- New sidecar and unique-lock rows no longer store plaintext copies of the value (`indexValue`, `entity.value`, and a value-bearing lock `id`); they keep owner keys and the field name. Reads never used these attributes, so existing rows remain fully readable.
+- Sidecars written by earlier releases for `id` and for fields that are now non-indexed are deleted, owner-guarded, when their record is next updated, deleted, consumed, or incremented (`cleanupNonIndexedSidecars`, default `true`). Records that are never mutated keep their old sidecars until deleted; they are harmless to reads but still hold the old plaintext copies, so rewrite or clean them up if that matters.
+
+### Fixed
+
+- The query planner now anchors keyed reads on the most selective scalar equality instead of the first one. Better Auth core looks up OAuth accounts with `providerId` before `accountId`, so every Google/Apple sign-in previously queried the `providerId` sidecar partition, drained every account of that provider, and issued one owner `GetItem` per account (or threw once `maxPages` was reached). Unique fields are preferred, then ordinary fields, then low-cardinality fields.
+
+### Added
+
+- `indexedFields` (per-model sidecar allowlist), `nonIndexedFields`, and `cleanupNonIndexedSidecars` options. By default Better Auth account secrets (`password`, `accessToken`, `refreshToken`, `idToken`) are no longer sidecar-indexed: core never queries by them, and each sidecar held extra plaintext copies and cost a transactional write on every token refresh.
+- `lowCardinalityFields` option, defaulting to `{ account: ["providerId"] }`, to tell the planner which fields to avoid as an anchor. Boolean and `null` equalities are always treated as low-cardinality. No storage-format change.
+
 ### Security
 
 - Transactional writes no longer request `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`. Nothing in the adapter read the returned items, but AWS attached the full stored row (for example an account's password hash or OAuth tokens) to `TransactionCanceledException.CancellationReasons[].Item`, and `DynamoDBConflictError` carried that exception as `cause`, so logging a conflict could leak secrets.
@@ -29,6 +44,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Applications should upgrade Better Auth to 1.7.16 or later for security;
   updating this adapter alone does not upgrade or patch the consuming
   application's Better Auth runtime.
+
+### Migration
+
+- Existing sidecar and single-field/schema unique-lock rows may contain plaintext value copies in `indexValue`, `entity.value`, or a value-bearing `id`. Any record mutation rewrites the sidecars and locks it touches atomically into the redacted shape; untouched records retain legacy copies until rewritten or removed. Existing hashed keys are unchanged, so legacy-format reads and uniqueness continue to work during rolling upgrades.
+- For a complete cleanup, stop writes, audit and repair duplicate ownership, then run an application-owned backfill that reads each entity by its `MODEL#/ID#` key, derives the current sidecar/lock keys, and conditionally replaces only rows whose `ownerPk` and `ownerSk` match that entity. Delete retired legacy rows only with the same owner condition; do not scan or delete by plaintext value alone. Resume writes only after the backfill and all writers use this format.
+- SHA-256 keys are unkeyed. Do not index low-entropy secrets: table readers who can observe hashes can perform dictionary/equality inference. No major version bump is required; this is backwards-compatible storage cleanup with an explicit migration path and no release/version bump.
 
 ## [1.1.0] - 2026-09-19
 

@@ -19,6 +19,21 @@ describe("public adapter and client helpers", () => {
     }
   });
 
+  it("never sidecar-indexes Better Auth account secrets by default, including remapped names", async () => {
+    const writes: TransactWriteCommand[] = [];
+    const send = async (command: any) => {
+      if (command.constructor.name === "TransactWriteCommand") writes.push(command);
+      return {};
+    };
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never })({ secret: "x", emailAndPassword: { enabled: true }, account: { fields: { accessToken: "access_token" } } } as never);
+    await adapter.create({ model: "account", data: { userId: "u", providerId: "google", accountId: "g", password: "hash", accessToken: "at", refreshToken: "rt", idToken: "it", createdAt: new Date(), updatedAt: new Date() } });
+    const items = (writes[0]?.input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    const indexed = items.filter((item) => item.model === "_index_account").map((item) => item.indexField);
+    expect(indexed).toEqual(expect.arrayContaining(["userId", "providerId", "accountId"]));
+    expect(indexed).not.toEqual(expect.arrayContaining(["password"]));
+    for (const field of ["password", "access_token", "accessToken", "refreshToken", "idToken"]) expect(indexed).not.toContain(field);
+  });
+
   it("creates a Better Auth adapter factory", async () => {
     const send = async (command: any) => {
       if (command.constructor.name === "GetCommand") return { Item: { pk: "MODEL#s4:user", sk: "ID#s1:u", id: "u", [REVISION_ATTRIBUTE]: "rev-1", entity: { id: "u", email: "a@example.com", emailVerified: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } } };

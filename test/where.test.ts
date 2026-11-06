@@ -54,6 +54,33 @@ describe("where planning and matching", () => {
     expect(planQuery(where).kind).toBe("byFieldValue");
   });
 
+  it("anchors keyed reads on the most selective equality instead of the first one", () => {
+    const accountKey = [clause("providerId", "eq", "google"), clause("accountId", "eq", "g-123")];
+    expect(planQuery(accountKey, false, { lowCardinalityFields: ["providerId"] }).clause?.field).toBe("accountId");
+    expect(planQuery(accountKey).clause?.field).toBe("providerId");
+    expect(planQuery([clause("org", "eq", "o1"), clause("email", "eq", "a@example.com")], false, { uniqueFields: ["email"] }).clause?.field).toBe("email");
+    expect(planQuery([clause("emailVerified", "eq", true), clause("org", "eq", "o1")]).clause?.field).toBe("org");
+    expect(planQuery([clause("deletedAt", "eq", null), clause("org", "eq", "o1")]).clause?.field).toBe("org");
+    expect(planQuery([clause("a", "eq", "1"), clause("b", "eq", "2")]).clause?.field).toBe("a");
+    expect(planQuery([clause("emailVerified", "eq", true)]).clause?.field).toBe("emailVerified");
+  });
+
+  it("treats only indexed fields as keyed anchors", () => {
+    expect(() => planQuery([clause("password", "eq", "x")], false, { nonIndexedFields: ["password"] })).toThrow(/Field "password" is not sidecar-indexed/);
+    expect(() => planQuery([clause("ipAddress", "eq", "x")], false, { indexedFields: ["token"] })).toThrow(/not sidecar-indexed/);
+    expect(() => planQuery([clause("ipAddress", "in", ["x"])], false, { indexedFields: ["token"] })).toThrow(/requires a table scan\. Pass unsafeAllowScan to enable bounded scans explicitly\.$/);
+    expect(planQuery([clause("ipAddress", "eq", "x")], true, { indexedFields: ["token"] }).kind).toBe("byModel");
+    expect(planQuery([clause("ipAddress", "eq", "x"), clause("token", "eq", "t")], false, { indexedFields: ["token"] }).clause?.field).toBe("token");
+    expect(planQuery([clause("ipAddress", "in", ["x"]), clause("token", "in", ["t"])], false, { indexedFields: ["token"] }).kind).toBe("byFieldValues");
+    expect(() => planQuery([clause("email", "eq", "A", { mode: "insensitive" }), clause("ipAddress", "eq", "x")], false, { indexedFields: ["email"] })).toThrow(/Case-insensitive/);
+    expect(planQuery([clause("id", "eq", "1")], false, { indexedFields: [] }).kind).toBe("byId");
+  });
+
+  it("does not anchor on insensitive or non-scalar equalities when ranking", () => {
+    const where = [clause("email", "eq", "A@EXAMPLE.COM", { mode: "insensitive" }), clause("emailVerified", "eq", true)];
+    expect(planQuery(where, false, { uniqueFields: ["email"] }).clause?.field).toBe("emailVerified");
+  });
+
   it("evaluates comparison, string, and set operators", () => {
     const item = { email: "Hello@Test.com", count: 2 };
     expect(matchesWhere(item, [clause("count", "gte", 2), clause("email", "ends_with", ".com")])).toBe(true);

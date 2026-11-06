@@ -11,8 +11,8 @@ import { createDocumentClient, normalizeOptions } from "./client.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, redactedAwsError, transactionCancellationCodes } from "./errors.js";
 import { entitySk, indexPk, modelPk } from "./keys.js";
 import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
-import type { CleanedWhere, DynamoDBStoreOptions, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
-import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, scalarValues } from "./where.js";
+import type { CleanedWhere, DynamoDBStoreOptions, PlannerHints, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
+import { eqWhere, inWhere, isIndexedField, matchesWhere, mostSelectiveEquality, planQuery, safeInWhere, scalarValues } from "./where.js";
 
 const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
@@ -38,13 +38,13 @@ export class DynamoDBStore {
   }
 
   async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }, select?: string[]): Promise<T[]> {
-    const plan = planQuery(where, this.options.unsafeAllowScan);
+    const plan = this.plan(model, where);
     const rows = await this.loadRows(model, plan);
     return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl, select) as T[];
   }
 
   async count(model: string, where: CleanedWhere[] = []): Promise<number> {
-    const plan = planQuery(where, this.options.unsafeAllowScan);
+    const plan = this.plan(model, where);
     const rows = await this.loadRows(model, plan);
     return rows.filter((row) => matchesWhere(row, where)).length;
   }
@@ -112,13 +112,22 @@ export class DynamoDBStore {
     }
   }
 
+  private plan(model: string, where: CleanedWhere[]): QueryPlan {
+    return planQuery(where, this.options.unsafeAllowScan, this.plannerHints(model));
+  }
+
+  private plannerHints(model: string): PlannerHints {
+    const indexedFields = this.options.indexedFields?.[model];
+    return { uniqueFields: this.options.uniqueFields?.[model] ?? [], lowCardinalityFields: this.options.lowCardinalityFields?.[model] ?? [], nonIndexedFields: this.options.nonIndexedFields?.[model] ?? [], ...(indexedFields ? { indexedFields } : {}) };
+  }
+
   private async targetByWhere(model: string, where: CleanedWhere[]): Promise<StoredItem | null> {
-    const rows = await this.loadRows(model, planQuery(where, this.options.unsafeAllowScan));
+    const rows = await this.loadRows(model, this.plan(model, where));
     return rows.find((row) => matchesWhere(row, where)) ?? null;
   }
 
   private async matchingTargets(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
-    const rows = await this.loadRows(model, planQuery(where, this.options.unsafeAllowScan));
+    const rows = await this.loadRows(model, this.plan(model, where));
     return rows.filter((row) => matchesWhere(row, where));
   }
 
@@ -130,7 +139,7 @@ export class DynamoDBStore {
   private async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
-    if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where);
+    if (plan.kind === "byFieldValue") return this.loadByField(model, plan);
     if (plan.kind === "byFieldValues") return this.loadByFields(model, plan.where);
     return this.scanModel(model);
   }
@@ -141,8 +150,8 @@ export class DynamoDBStore {
     return visibleRows(result.Item ? [result.Item as StoredItem] : [], this.options.ttl);
   }
 
-  private async loadByField(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
-    const clause = firstEquality(where);
+  private async loadByField(model: string, plan: QueryPlan): Promise<StoredItem[]> {
+    const clause = plan.clause ?? mostSelectiveEquality(plan.where, this.plannerHints(model));
     if (!clause) return [];
     const sidecars = await this.queryAllSidecars(model, clause);
     return this.loadOwners(sidecars, clause);
@@ -173,10 +182,10 @@ export class DynamoDBStore {
     const newSidecars = this.allSidecars(model, newItem.entity);
     const deletes = removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item));
     const puts = addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item));
-    const updates = retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl));
+    const updates = retainedSidecars(oldSidecars, newSidecars).map(([, newSidecar]) => rewriteSidecarOf(this.options.tableName, newSidecar));
     const condition = revisionCondition(oldItem);
     const entity = { Put: { TableName: this.options.tableName, Item: newItem, ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values } };
-    const actions = [entity, ...deletes, ...puts, ...updates];
+    const actions = [entity, ...deletes, ...puts, ...updates, ...this.retiredSidecarDeletes(model, oldItem.entity)];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
@@ -185,7 +194,7 @@ export class DynamoDBStore {
     const condition = revisionCondition(item);
     const entity = { Delete: { TableName: this.options.tableName, Key: keyOf(item), ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values } };
     const sidecars = this.allSidecars(String(item.model), item.entity).map((sidecar) => deleteOf(this.options.tableName, sidecar));
-    const actions = [entity, ...sidecars];
+    const actions = [entity, ...sidecars, ...this.retiredSidecarDeletes(String(item.model), item.entity)];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
@@ -193,7 +202,7 @@ export class DynamoDBStore {
   private async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
     const oldSidecars = this.allSidecars(model, oldItem.entity);
     const newSidecars = this.allSidecars(model, newItem.entity);
-    const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl))];
+    const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).map(([, newSidecar]) => rewriteSidecarOf(this.options.tableName, newSidecar)), ...this.retiredSidecarDeletes(model, oldItem.entity)];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
@@ -222,7 +231,15 @@ export class DynamoDBStore {
   }
 
   private sidecars(model: string, data: Record<string, unknown>): SidecarItem[] {
-    return toIndexSidecars(model, data, this.options.ttl);
+    const hints = this.plannerHints(model);
+    return toIndexSidecars(model, data, this.options.ttl, (field) => isIndexedField(field, hints));
+  }
+
+  /** Sidecars older versions wrote for fields that are no longer indexed; deleted (owner-guarded) on mutation. */
+  private retiredSidecarDeletes(model: string, data: Record<string, unknown>) {
+    if (this.options.cleanupNonIndexedSidecars === false) return [];
+    const hints = this.plannerHints(model);
+    return toIndexSidecars(model, data, this.options.ttl, (field) => !isIndexedField(field, hints)).map((item) => deleteOf(this.options.tableName, item));
   }
 
   private uniqueLocks(model: string, data: Record<string, unknown>): SidecarItem[] {
@@ -244,7 +261,7 @@ export class DynamoDBStore {
   }
 
   private async loadByFields(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
-    const clause = safeInWhere(where);
+    const clause = safeInWhere(where, this.plannerHints(model));
     if (!clause) return [];
     const values = [...new Map(scalarValues(clause).map((value) => [JSON.stringify([typeof value, value instanceof Date ? value.toISOString() : value]), value])).values()];
     assertInValueCount(values.length);
@@ -299,29 +316,9 @@ function putNewOf(tableName: string, item: StoredItem | SidecarItem) {
   return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(pk)" } };
 }
 
-function ttlUpdateOf(tableName: string, oldItem: SidecarItem, newItem: SidecarItem, ttl?: false | TtlOptions) {
-  if (!ttl) return [];
-  const attribute = ttlAttribute(ttl);
-  const oldTtl = oldItem[attribute];
-  const newTtl = newItem[attribute];
-  if (oldTtl === newTtl) return [];
-  return [newTtl === undefined ? removeTtlOf(tableName, newItem, attribute) : setTtlOf(tableName, newItem, attribute, newTtl)];
-}
-
-function setTtlOf(tableName: string, item: SidecarItem, attribute: string, ttlValue: unknown) {
-  return { Update: { ...ownerUpdateBase(tableName, item, attribute), UpdateExpression: "SET #ttl = :ttl", ExpressionAttributeValues: { ...ownerValues(item), ":ttl": ttlValue } } };
-}
-
-function removeTtlOf(tableName: string, item: SidecarItem, attribute: string) {
-  return { Update: { ...ownerUpdateBase(tableName, item, attribute), UpdateExpression: "REMOVE #ttl", ExpressionAttributeValues: ownerValues(item) } };
-}
-
-function ownerUpdateBase(tableName: string, item: SidecarItem, ttlName: string) {
-  return { TableName: tableName, Key: keyOf(item), ConditionExpression: "attribute_exists(#pk) AND #ownerPk = :ownerPk AND #ownerSk = :ownerSk", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk", "#ttl": ttlName } };
-}
-
-function ownerValues(item: SidecarItem) {
-  return { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk };
+/** Replace an existing sidecar/lock while refusing to overwrite another owner's row. */
+function rewriteSidecarOf(tableName: string, item: SidecarItem) {
+  return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk } } };
 }
 
 function incrementUpdateOf(tableName: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, ttl?: false | TtlOptions) {

@@ -6,7 +6,7 @@ import {
   ResourceNotFoundException,
   waitUntilTableExists
 } from "@aws-sdk/client-dynamodb";
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
@@ -17,6 +17,7 @@ import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dyn
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
+import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
 const REGION = "us-east-1";
@@ -311,6 +312,33 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "plugin", where: [eq("id", "active")] })).resolves.toMatchObject({ id: "active", ttl: 1, expiresAt: "2030-01-01T00:00:00.000Z" });
   });
 
+  it("stores account secrets only on the entity row and cleans up sidecars written before they were excluded", async () => {
+    // The bare store has no factory defaults, so it indexes every scalar field like earlier releases did.
+    const legacy = new DynamoDBStore({ tableName, client: docClient });
+    await legacy.create("account", { id: "acc-legacy", userId: "u-sec", providerId: "google", accountId: "g-legacy", accessToken: "legacy-token", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    const adapter = adapterFor({ client: docClient });
+    await create(adapter, "user", { id: "u-sec", name: "S", email: "sec@example.com" });
+    await expect(rawRowsByModel("_index_account")).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ indexField: "accessToken" })]));
+
+    await create(adapter, "account", { id: "acc-new", userId: "u-sec", providerId: "credential", accountId: "u-sec", password: "pw-hash", accessToken: "new-token", refreshToken: "refresh", idToken: "idt" });
+    await adapter.update({ model: "account", where: [eq("id", "acc-legacy")], update: { accessToken: "rotated-token" } });
+
+    const sidecars = await rawRowsByModel("_index_account");
+    expect(sidecars.map((row) => row.indexField)).not.toEqual(expect.arrayContaining(["accessToken"]));
+    for (const field of ["password", "accessToken", "refreshToken", "idToken", "id"]) expect(sidecars.some((row) => row.indexField === field)).toBe(false);
+    expect(JSON.stringify(sidecars)).not.toMatch(/pw-hash|token|refresh|idt/);
+    await expect(adapter.findOne({ model: "account", where: [eq("providerId", "google"), eq("accountId", "g-legacy")] })).resolves.toMatchObject({ accessToken: "rotated-token" });
+  });
+
+  it("resolves OAuth account keys without walking every account of the provider", async () => {
+    const adapter = adapterFor({ client: docClient, pageSize: 1, maxPages: 3 });
+    await create(adapter, "user", { id: "u-oauth", name: "O", email: "oauth@example.com" });
+    for (let index = 0; index < 8; index += 1) await create(adapter, "account", { id: `acc-${index}`, userId: "u-oauth", providerId: "google", accountId: `google-${index}` });
+
+    await expect(adapter.findOne({ model: "account", where: [eq("providerId", "google"), eq("accountId", "google-5")] })).resolves.toMatchObject({ id: "acc-5" });
+    await expect(adapter.findOne({ model: "account", where: [eq("providerId", "apple"), eq("accountId", "google-5")] })).resolves.toBeNull();
+  });
+
   it("uses real DynamoDB Query and Scan pagination with small page sizes", async () => {
     const adapter = adapterFor({ client: docClient, unsafeAllowScan: true, pageSize: 1, maxPages: 30 });
     await create(adapter, "user", { id: "u1", name: "C", org: "o1", email: "c@example.com" });
@@ -361,6 +389,30 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-1")], limit: 10 })).resolves.toHaveLength(1);
   });
 
+  it("does not store plaintext schema tuples and rewrites legacy sidecars and locks", async () => {
+    const adapter = dynamoDBAdapter({ tableName, client: docClient, enforceSchemaUniqueIndexes: true, uniqueFields: { oauthClientResource: ["clientId"] } } as never)(schemaAuthOptions() as never) as TestAdapter;
+    await create(adapter, "oauthClientResource", { id: "legacy-redact", clientId: "client-redact", resourceId: "resource-redact" });
+    const ownerPk = modelPk("oauthClientResource");
+    const ownerSk = entitySk("legacy-redact");
+    const sidecarKey = { pk: indexPk("oauthClientResource", "clientId", "client-redact"), sk: indexSk("legacy-redact") };
+    const lockKey = { pk: uniquePk("oauthClientResource", "clientId"), sk: valueSk("client-redact", "") };
+    const tupleKey = { pk: compoundUniquePk("oauthClientResource", compoundUniqueIndexName(["clientId", "resourceId"])), sk: compoundUniqueSk(["client-redact", "resource-redact"]) };
+    const owner = { ownerPk, ownerSk };
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...sidecarKey, model: "_index_oauthClientResource", id: "clientId:legacy-redact", entity: { ...owner, field: "clientId", value: "client-redact" }, ...owner, indexModel: "oauthClientResource", indexField: "clientId", indexValue: "client-redact" } }));
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...lockKey, model: "_unique_oauthClientResource", id: "clientId:client-redact", entity: { ...owner, field: "clientId", value: "client-redact" }, ...owner } }));
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...tupleKey, model: "_unique2_oauthClientResource", id: "clientId_resourceId:legacy-redact", entity: { ...owner, fields: ["clientId", "resourceId"], values: ["client-redact", "resource-redact"] }, ...owner } }));
+
+    await expect(adapter.findOne({ model: "oauthClientResource", where: [eq("clientId", "client-redact")] })).resolves.toMatchObject({ id: "legacy-redact" });
+    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "legacy-redact")], update: { resourceId: "resource-redact" } })).resolves.toMatchObject({ resourceId: "resource-redact" });
+    for (const row of [await rawRow(sidecarKey.pk, sidecarKey.sk), await rawRow(lockKey.pk, lockKey.sk), await rawRow(tupleKey.pk, tupleKey.sk)]) {
+      expect(JSON.stringify(row)).not.toContain("client-redact");
+      expect(JSON.stringify(row)).not.toContain("resource-redact");
+      expect(row).not.toHaveProperty("indexValue");
+      expect(row).not.toHaveProperty("entity.value");
+      expect(row).not.toHaveProperty("entity.values");
+    }
+  });
+
   it("cleans compound locks across conflicting update and delete operations", async () => {
     const adapter = schemaIndexAdapter(true);
     await create(adapter, "oauthClientResource", { id: "compound-a", clientId: "client-a", resourceId: "resource-a" });
@@ -404,7 +456,8 @@ describe("DynamoDB Local adapter integration", () => {
 
   it("rejects a transaction over 100 actions before writing", async () => {
     const sends = { count: 0 };
-    const adapter = adapterFor({ client: countingClient(sends) });
+    // entity + 99 sidecars + 1 unique lock = 101 actions (id is the entity key and has no sidecar).
+    const adapter = adapterFor({ client: countingClient(sends), uniqueFields: { wide: ["field-0"] } });
     const data: Record<string, unknown> = { id: "too-many-actions" };
     for (let index = 0; index < 99; index += 1) data[`field-${index}`] = `value-${index}`;
 

@@ -16,6 +16,30 @@ export interface BetterAuthDynamoDBOptions {
   enforceSchemaUniqueIndexes?: boolean;
   /** Maximum number of independent bulk transactions in flight. */
   maxBulkConcurrency?: number;
+  /**
+   * Fields whose values are shared by many rows (per model). The query planner avoids
+   * anchoring a keyed read on these when a more selective equality is available.
+   * Merged with the built-in default `{ account: ["providerId"] }`.
+   */
+  lowCardinalityFields?: Record<string, string[]>;
+  /**
+   * Per-model allowlist of fields that get equality sidecar rows (storage model/field names).
+   * Models not listed keep the default of indexing every scalar field. Equality queries on a
+   * field that is not indexed need another indexed anchor or `unsafeAllowScan`.
+   */
+  indexedFields?: Record<string, string[]>;
+  /**
+   * Fields that never get equality sidecar rows. Merged with the built-in default
+   * `{ account: ["password", "accessToken", "refreshToken", "idToken"] }`; `id` is never
+   * sidecar-indexed because it is the entity key.
+   */
+  nonIndexedFields?: Record<string, string[]>;
+  /**
+   * Delete sidecar rows that older versions wrote for fields that are no longer indexed, as
+   * part of each update/delete/consume/increment of the owning record. Defaults to `true`.
+   * Set `false` on new tables, or once existing rows have been rewritten or cleaned up.
+   */
+  cleanupNonIndexedSidecars?: boolean;
 }
 
 /** Store options: public adapter options plus schema metadata resolved and validated by the adapter factory. */
@@ -56,7 +80,6 @@ export interface SidecarItem extends Record<string, unknown> {
   ownerSk: string;
   indexModel?: string;
   indexField?: string;
-  indexValue?: unknown;
   ttl?: number;
 }
 
@@ -71,4 +94,14 @@ export interface CleanedWhere {
 export interface QueryPlan {
   kind: "byId" | "byIdValues" | "byFieldValue" | "byFieldValues" | "byModel";
   where: CleanedWhere[];
+  /** The equality clause chosen to anchor a byFieldValue sidecar query. */
+  clause?: CleanedWhere;
+}
+
+export interface PlannerHints {
+  uniqueFields?: readonly string[];
+  lowCardinalityFields?: readonly string[];
+  /** When set, only these fields have sidecars. */
+  indexedFields?: readonly string[];
+  nonIndexedFields?: readonly string[];
 }

@@ -51,11 +51,11 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, ttl: { defaultField: "expiresAt" }, uniqueFields: { session: ["email"] } });
     await store.update("session", [eq("id", "s1")], { expiresAt: "2031-01-01T00:00:00.000Z" });
     const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    const updates = command.input.TransactItems?.flatMap((item) => (item.Update ? [item.Update] : [])) ?? [];
-    expect(updates).toEqual(expect.arrayContaining([expect.objectContaining({ Key: expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1") }), UpdateExpression: "SET #ttl = :ttl", ConditionExpression: "attribute_exists(#pk) AND #ownerPk = :ownerPk AND #ownerSk = :ownerSk", ExpressionAttributeValues: expect.objectContaining({ ":ownerPk": modelPk("session"), ":ownerSk": entitySk("s1"), ":ttl": 1924992000 }) }), expect.objectContaining({ Key: { pk: uniquePk("session", "email"), sk: valueSk("a@example.com", "") }, UpdateExpression: "SET #ttl = :ttl", ExpressionAttributeValues: expect.objectContaining({ ":ttl": 1924992000 }) })]));
+    const puts = command.input.TransactItems?.flatMap((item) => (item.Put?.Item ? [item.Put.Item] : [])) ?? [];
+    expect(puts).toEqual(expect.arrayContaining([expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1"), ttl: 1924992000 }), expect.objectContaining({ pk: uniquePk("session", "email"), sk: valueSk("a@example.com", ""), ttl: 1924992000 })]));
     const keys = command.input.TransactItems?.map((item) => `${item.Put?.Item?.pk ?? item.Delete?.Key?.pk ?? item.Update?.Key?.pk}\u0000${item.Put?.Item?.sk ?? item.Delete?.Key?.sk ?? item.Update?.Key?.sk}`) ?? [];
     expect(new Set(keys).size).toBe(keys.length);
-    expect(updates.every((update) => update.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
+    expect(command.input.TransactItems?.every((item) => item.Put?.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
   });
 
   it("shortens and removes retained sidecar TTL metadata atomically", async () => {
@@ -64,11 +64,11 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, ttl: { defaultField: "expiresAt" }, uniqueFields: { session: ["email"] } });
     await store.update("session", [eq("id", "s1")], { expiresAt: "2030-01-01T00:00:00.000Z" });
     let command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.some((item) => item.Update?.UpdateExpression === "SET #ttl = :ttl" && item.Update.ExpressionAttributeValues?.[":ttl"] === 1893456000)).toBe(true);
+    expect(command.input.TransactItems?.some((item) => item.Put?.Item?.ttl === 1893456000)).toBe(true);
     doc.send.mockClear();
     await store.update("session", [eq("id", "s1")], { expiresAt: null });
     command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.some((item) => item.Update?.UpdateExpression === "REMOVE #ttl" && item.Update.ExpressionAttributeValues?.[":ownerPk"] === modelPk("session"))).toBe(true);
+    expect(command.input.TransactItems?.some((item) => item.Put?.Item && !Object.hasOwn(item.Put.Item, "ttl") && item.Put.Item.pk === indexPk("session", "email", "a@example.com"))).toBe(true);
   });
 
   it("uses transactional uniqueness locks for configured unique fields", async () => {
@@ -77,8 +77,67 @@ describe("DynamoDBStore", () => {
     await store.create("user", { id: "u1", email: "a@example.com" });
     const command = doc.send.mock.calls[0]?.[0] as TransactWriteCommand;
     expect(command).toBeInstanceOf(TransactWriteCommand);
-    expect(command.input.TransactItems).toHaveLength(4);
+    // entity + email sidecar + email unique lock; `id` is the entity key and gets no sidecar.
+    expect(command.input.TransactItems).toHaveLength(3);
     expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("user", "email") }) }) }));
+  });
+
+  it("never sidecar-indexes id or configured non-indexed fields, and keeps no plaintext value copies", async () => {
+    const doc = client();
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { account: ["accountId"] }, nonIndexedFields: { account: ["password", "accessToken"] } });
+    await store.create("account", { id: "a1", userId: "u1", providerId: "credential", accountId: "u1", password: "hash", accessToken: "secret" });
+    const items = ((doc.send.mock.calls[0]?.[0] as TransactWriteCommand).input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    const sidecars = items.filter((item) => item.model === "_index_account");
+    expect(sidecars.map((item) => item.indexField).sort()).toEqual(["accountId", "providerId", "userId"]);
+    for (const item of items.filter((row) => row.model !== "account")) {
+      expect(JSON.stringify(item)).not.toMatch(/hash|secret/);
+      expect(item).not.toHaveProperty("indexValue");
+      expect(item.entity).not.toHaveProperty("value");
+    }
+    expect(items.find((item) => item.model === "_unique_account")?.id).toBe("accountId:a1");
+  });
+
+  it("limits sidecars to a configured per-model allowlist", async () => {
+    const doc = client();
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, indexedFields: { session: ["token", "userId"] } });
+    await store.create("session", { id: "s1", token: "t1", userId: "u1", ipAddress: "1.2.3.4", userAgent: "x", expiresAt: "2030-01-01T00:00:00.000Z" });
+    const items = ((doc.send.mock.calls[0]?.[0] as TransactWriteCommand).input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    expect(items.filter((item) => item.model === "_index_session").map((item) => item.indexField).sort()).toEqual(["token", "userId"]);
+    await store.create("user", { id: "u1", name: "A" });
+    const userItems = ((doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    expect(userItems.filter((item) => item.model === "_index_user").map((item) => item.indexField)).toEqual(["name"]);
+  });
+
+  it("refuses to anchor on non-indexed fields but still uses another indexed anchor", async () => {
+    const owner = { pk: modelPk("session"), sk: entitySk("s1"), id: "s1", token: "t1", userAgent: "x", entity: { id: "s1", token: "t1", userAgent: "x" }, ...rev };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof QueryCommand ? { Items: [{ pk: "x", sk: indexSk("s1"), ownerPk: modelPk("session"), ownerSk: entitySk("s1"), entity: {} }] } : { Item: owner }));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, indexedFields: { session: ["token"] } });
+    await expect(store.findOne("session", [eq("userAgent", "x")])).rejects.toThrow(/Field "userAgent" is not sidecar-indexed/);
+    await expect(store.findMany("session", [{ field: "userAgent", operator: "in", value: ["x"], connector: "AND", mode: "sensitive" }])).rejects.toThrow(UnsupportedQueryError);
+    await expect(store.findOne("session", [eq("userAgent", "x"), eq("token", "t1")])).resolves.toMatchObject({ id: "s1" });
+    const query = doc.send.mock.calls.map((call) => call[0]).find((command) => command instanceof QueryCommand) as QueryCommand;
+    expect(query.input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("session", "token", "t1"));
+  });
+
+  it("deletes retired sidecars of non-indexed fields on mutation unless cleanup is disabled", async () => {
+    const row = { pk: modelPk("account"), sk: entitySk("a1"), model: "account", id: "a1", userId: "u1", password: "hash", entity: { id: "a1", userId: "u1", password: "hash" }, ...rev };
+    const retiredKeys = [indexPk("account", "id", "a1"), indexPk("account", "password", "hash")];
+    for (const cleanupNonIndexedSidecars of [undefined, false]) {
+      for (const mutate of [(store: DynamoDBStore) => store.update("account", [eq("id", "a1")], { password: "hash2" }), (store: DynamoDBStore) => store.delete("account", [eq("id", "a1")]), (store: DynamoDBStore) => store.incrementOne("account", [eq("id", "a1")], { logins: 1 })]) {
+        const doc = client([row]);
+        const store = new DynamoDBStore({ tableName: "auth", client: doc as never, nonIndexedFields: { account: ["password"] }, ...(cleanupNonIndexedSidecars === undefined ? {} : { cleanupNonIndexedSidecars }) });
+        await mutate(store);
+        const actions = (doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems ?? [];
+        const deleted = actions.flatMap((action) => (action.Delete ? [String(action.Delete.Key?.pk)] : []));
+        const putPks = actions.flatMap((action) => (action.Put ? [String(action.Put.Item?.pk)] : []));
+        expect(putPks).not.toContain(indexPk("account", "password", "hash2"));
+        if (cleanupNonIndexedSidecars === false) expect(deleted.filter((pk) => retiredKeys.includes(pk))).toEqual([]);
+        else expect(deleted).toEqual(expect.arrayContaining(retiredKeys));
+        const retired = actions.find((action) => action.Delete?.Key?.pk === indexPk("account", "password", "hash"));
+        if (retired) expect(retired.Delete?.ConditionExpression).toBe("attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)");
+      }
+    }
   });
 
   it("guards sidecar and unique-lock deletion by the expected owner", async () => {
@@ -124,6 +183,27 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
 
     await expect(store.findMany("user", [], 10, 0, undefined, ["id", "email"])).resolves.toEqual([{ id: "u1", email: "a@example.com" }]);
+  });
+
+  it("queries the accountId sidecar, not the shared providerId sidecar, for Better Auth account lookups", async () => {
+    const owner = { pk: modelPk("account"), sk: entitySk("a1"), id: "a1", providerId: "google", accountId: "g-1", entity: { id: "a1", providerId: "google", accountId: "g-1" }, ...rev };
+    const sidecar = { pk: indexPk("account", "accountId", "g-1"), sk: indexSk("a1"), ownerPk: modelPk("account"), ownerSk: entitySk("a1"), entity: {} };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof QueryCommand ? { Items: [sidecar] } : { Item: owner }));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, lowCardinalityFields: { account: ["providerId"] } });
+    await expect(store.findOne("account", [eq("providerId", "google"), eq("accountId", "g-1")])).resolves.toMatchObject({ id: "a1" });
+    const query = doc.send.mock.calls.map((call) => call[0]).find((command) => command instanceof QueryCommand) as QueryCommand;
+    expect(query.input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("account", "accountId", "g-1"));
+  });
+
+  it("prefers configured unique fields as the keyed anchor", async () => {
+    const owner = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", org: "o1", email: "a@example.com", entity: { id: "u1", org: "o1", email: "a@example.com" }, ...rev };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof QueryCommand ? { Items: [{ pk: "x", sk: indexSk("u1"), ownerPk: modelPk("user"), ownerSk: entitySk("u1"), entity: {} }] } : { Item: owner }));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { user: ["email"] } });
+    await store.findOne("user", [eq("org", "o1"), eq("email", "a@example.com")]);
+    const query = doc.send.mock.calls.map((call) => call[0]).find((command) => command instanceof QueryCommand) as QueryCommand;
+    expect(query.input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("user", "email", "a@example.com"));
   });
 
   it("preserves typed scalar equality in sidecar keys for plugin-like fields", async () => {

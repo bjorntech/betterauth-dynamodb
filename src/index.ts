@@ -22,7 +22,9 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
     adapter: ({ schema, getModelName, getFieldName }) => {
       const schemaUniqueFields = collectUniqueFields(schema, getModelName, getFieldName);
       const schemaUniqueIndexes = adapterOptions.enforceSchemaUniqueIndexes ? collectSchemaUniqueIndexes(schema, getModelName, getFieldName) : [];
-      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), schemaUniqueIndexes });
+      const lowCardinalityFields = mergeUniqueFields(defaultLowCardinalityFields(getModelName, getFieldName), adapterOptions.lowCardinalityFields);
+      const nonIndexedFields = mergeUniqueFields(defaultNonIndexedFields(getModelName, getFieldName), adapterOptions.nonIndexedFields);
+      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), lowCardinalityFields, nonIndexedFields, schemaUniqueIndexes });
       const adapter: any = {
         create: <T extends Record<string, unknown>>(data: { model: string; data: T }) => store.create(data.model, data.data),
         findOne: <T>(data: { model: string; where: any[]; select?: string[]; join?: Record<string, unknown> }) => {
@@ -54,6 +56,18 @@ function mergeUniqueFields(...sources: (Record<string, string[]> | undefined)[])
     for (const [model, fields] of Object.entries(source ?? {})) merged[model] = [...new Set([...(merged[model] ?? []), ...fields])];
   }
   return merged;
+}
+
+/** Better Auth core looks accounts up by providerId + accountId with providerId first; providerId is shared by every account of a provider. */
+function defaultLowCardinalityFields(getModelName: ModelNameResolver, getFieldName: FieldNameResolver): Record<string, string[]> {
+  return { [getModelName("account")]: [getFieldName({ model: "account", field: "providerId" })] };
+}
+
+/** Secrets Better Auth core never queries by; indexing them only multiplies copies and write cost. */
+const DEFAULT_NON_INDEXED_ACCOUNT_FIELDS = ["password", "accessToken", "refreshToken", "idToken"];
+
+function defaultNonIndexedFields(getModelName: ModelNameResolver, getFieldName: FieldNameResolver): Record<string, string[]> {
+  return { [getModelName("account")]: DEFAULT_NON_INDEXED_ACCOUNT_FIELDS.map((field) => getFieldName({ model: "account", field })) };
 }
 
 type AdapterSchema = Record<string, { fields: Record<string, { unique?: boolean | undefined }> }>;
