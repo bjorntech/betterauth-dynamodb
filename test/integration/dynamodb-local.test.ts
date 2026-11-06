@@ -6,11 +6,12 @@ import {
   ResourceNotFoundException,
   waitUntilTableExists
 } from "@aws-sdk/client-dynamodb";
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
+import { emailOTP } from "better-auth/plugins/email-otp";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
@@ -201,6 +202,100 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findMany({ model: "session", where: [eq("userId", "u1")], limit: 10 })).resolves.toEqual([]);
   });
 
+  it("does not resurrect an older expired verification row after the latest expires", async () => {
+    const adapter = adapterFor({ client: docClient, ttl: { fields: { verification: "expiresAt" } } });
+    await create(adapter, "verification", {
+      id: "expired-old",
+      identifier: "email-otp:expired@example.com",
+      value: "old:0",
+      createdAt: new Date("2020-01-01T00:00:00.100Z"),
+      expiresAt: "2020-01-01T00:00:01.000Z"
+    });
+    await create(adapter, "verification", {
+      id: "expired-latest",
+      identifier: "email-otp:expired@example.com",
+      value: "latest:0",
+      createdAt: new Date("2020-01-01T00:00:00.900Z"),
+      expiresAt: "2020-01-01T00:00:02.000Z"
+    });
+
+    // Both rows are expired, so logical TTL hiding must happen before the
+    // Better Auth verification lookup can select a row by createdAt.
+    await expect(adapter.findMany({ model: "verification", where: [eq("identifier", "email-otp:expired@example.com")], limit: 1, sortBy: { field: "createdAt", direction: "desc" } })).resolves.toEqual([]);
+  });
+
+  it("serializes concurrent Better Auth OTP guesses through one comparison", async () => {
+    const email = "otp-race@example.com";
+    const otp = "654321";
+    let comparisons = 0;
+    let signalComparison!: () => void;
+    const comparisonStarted = new Promise<void>((resolve) => { signalComparison = resolve; });
+    let releaseComparison!: () => void;
+    const comparisonHeld = new Promise<void>((resolve) => { releaseComparison = resolve; });
+
+    const auth = betterAuth({
+      secret: "test-secret-that-is-long-enough-for-better-auth",
+      baseURL: "http://localhost:3000",
+      database: dynamoDBAdapter({ tableName, client: docClient }),
+      emailAndPassword: { enabled: true },
+      verification: { disableCleanup: true },
+      plugins: [emailOTP({
+        allowedAttempts: 1,
+        generateOTP: () => otp,
+        async sendVerificationOTP() {},
+        storeOTP: {
+          async hash(value) {
+            if (value === "000000" || value === "111111") {
+              comparisons += 1;
+              if (value === "000000") {
+                signalComparison();
+                await comparisonHeld;
+              }
+            }
+            return `stored-${value}`;
+          }
+        }
+      })]
+    });
+
+    await expect(auth.handler(jsonRequest("/api/auth/email-otp/send-verification-otp", { email, type: "sign-in" }))).resolves.toMatchObject({ status: 200 });
+    const first = auth.handler(jsonRequest("/api/auth/email-otp/check-verification-otp", { email, type: "sign-in", otp: "000000" }));
+    const firstOutcome = first.then(
+      (response) => ({ kind: "fulfilled" as const, response }),
+      (error) => ({ kind: "rejected" as const, error })
+    );
+    let second: Response | undefined;
+    let coordinationError: unknown;
+    try {
+      const gate = await withTimeout(Promise.race([
+        comparisonStarted.then(() => "comparison-started" as const),
+        firstOutcome.then(() => "request-completed" as const)
+      ]), "the first OTP comparison to start");
+      if (gate === "request-completed") throw new Error("The first OTP request completed before storeOTP.hash reached its comparison gate.");
+      const secondRequest = auth.handler(jsonRequest("/api/auth/email-otp/check-verification-otp", { email, type: "sign-in", otp: "111111" }));
+      second = await withTimeout(secondRequest, "the concurrent second OTP request to settle");
+    } catch (error) {
+      coordinationError = error;
+    } finally {
+      releaseComparison();
+    }
+    const firstResult = await withTimeout(firstOutcome, "the first OTP request to settle");
+    if (coordinationError) throw coordinationError;
+    if (firstResult.kind === "rejected") throw firstResult.error;
+    const firstResponse = firstResult.response;
+
+    expect(firstResponse.status).toBe(400);
+    expect(second?.status).toBe(400);
+    expect(comparisons).toBe(1);
+    const context = await auth.$context;
+    const verification = await context.internalAdapter.findVerificationValue("sign-in-otp-otp-race@example.com");
+    expect(verification?.value).toMatch(/:1$/);
+
+    const later = await auth.handler(jsonRequest("/api/auth/email-otp/check-verification-otp", { email, type: "sign-in", otp }));
+    expect(later.status).toBe(403);
+    await expect(later.json()).resolves.toMatchObject({ code: "TOO_MANY_ATTEMPTS" });
+  });
+
   it("stores epoch-zero TTL explicitly and treats the row as logically expired", async () => {
     const adapter = adapterFor({ client: docClient, ttl: { fields: { session: "expiresAt" } } });
     await create(adapter, "session", { id: "epoch-zero", token: "epoch-zero-token", userId: "u1", expiresAt: new Date(0) });
@@ -292,6 +387,30 @@ describe("DynamoDB Local adapter integration", () => {
     expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
     expect(attempts.filter((attempt) => attempt.status === "rejected")).toHaveLength(1);
     await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-1")], limit: 10 })).resolves.toHaveLength(1);
+  });
+
+  it("does not store plaintext schema tuples and rewrites legacy sidecars and locks", async () => {
+    const adapter = dynamoDBAdapter({ tableName, client: docClient, enforceSchemaUniqueIndexes: true, uniqueFields: { oauthClientResource: ["clientId"] } } as never)(schemaAuthOptions() as never) as TestAdapter;
+    await create(adapter, "oauthClientResource", { id: "legacy-redact", clientId: "client-redact", resourceId: "resource-redact" });
+    const ownerPk = modelPk("oauthClientResource");
+    const ownerSk = entitySk("legacy-redact");
+    const sidecarKey = { pk: indexPk("oauthClientResource", "clientId", "client-redact"), sk: indexSk("legacy-redact") };
+    const lockKey = { pk: uniquePk("oauthClientResource", "clientId"), sk: valueSk("client-redact", "") };
+    const tupleKey = { pk: compoundUniquePk("oauthClientResource", compoundUniqueIndexName(["clientId", "resourceId"])), sk: compoundUniqueSk(["client-redact", "resource-redact"]) };
+    const owner = { ownerPk, ownerSk };
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...sidecarKey, model: "_index_oauthClientResource", id: "clientId:legacy-redact", entity: { ...owner, field: "clientId", value: "client-redact" }, ...owner, indexModel: "oauthClientResource", indexField: "clientId", indexValue: "client-redact" } }));
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...lockKey, model: "_unique_oauthClientResource", id: "clientId:client-redact", entity: { ...owner, field: "clientId", value: "client-redact" }, ...owner } }));
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...tupleKey, model: "_unique2_oauthClientResource", id: "clientId_resourceId:legacy-redact", entity: { ...owner, fields: ["clientId", "resourceId"], values: ["client-redact", "resource-redact"] }, ...owner } }));
+
+    await expect(adapter.findOne({ model: "oauthClientResource", where: [eq("clientId", "client-redact")] })).resolves.toMatchObject({ id: "legacy-redact" });
+    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "legacy-redact")], update: { resourceId: "resource-redact" } })).resolves.toMatchObject({ resourceId: "resource-redact" });
+    for (const row of [await rawRow(sidecarKey.pk, sidecarKey.sk), await rawRow(lockKey.pk, lockKey.sk), await rawRow(tupleKey.pk, tupleKey.sk)]) {
+      expect(JSON.stringify(row)).not.toContain("client-redact");
+      expect(JSON.stringify(row)).not.toContain("resource-redact");
+      expect(row).not.toHaveProperty("indexValue");
+      expect(row).not.toHaveProperty("entity.value");
+      expect(row).not.toHaveProperty("entity.values");
+    }
   });
 
   it("cleans compound locks across conflicting update and delete operations", async () => {
@@ -544,6 +663,18 @@ function realProviderAdapter(enforce: boolean): TestAdapter {
 
 function jsonRequest(path: string, body: Record<string, unknown>): Request {
   return new Request(`http://localhost:3000${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label} after ${timeoutMs}ms.`)), timeoutMs); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function create(adapter: TestAdapter, model: string, data: Record<string, unknown>): Promise<Record<string, unknown>> {

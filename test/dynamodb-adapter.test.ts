@@ -31,7 +31,7 @@ describe("DynamoDBStore", () => {
     expect(puts?.[0]).toHaveProperty(REVISION_ATTRIBUTE, expect.any(String));
     expect(puts).toContainEqual(expect.objectContaining({ pk: indexPk("session", "userId", "u1"), sk: indexSk("s1"), ttl: 1893456000 }));
     expect(command.input.ClientRequestToken).toMatch(/^[0-9a-f-]{36}$/);
-    expect(command.input.TransactItems?.every((item) => item.Put?.ReturnValuesOnConditionCheckFailure === "ALL_OLD")).toBe(true);
+    expect(command.input.TransactItems?.every((item) => item.Put?.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
   });
 
   it("strips top-level and nested undefined values before command construction", async () => {
@@ -51,11 +51,11 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, ttl: { defaultField: "expiresAt" }, uniqueFields: { session: ["email"] } });
     await store.update("session", [eq("id", "s1")], { expiresAt: "2031-01-01T00:00:00.000Z" });
     const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    const updates = command.input.TransactItems?.flatMap((item) => (item.Update ? [item.Update] : [])) ?? [];
-    expect(updates).toEqual(expect.arrayContaining([expect.objectContaining({ Key: expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1") }), UpdateExpression: "SET #ttl = :ttl", ConditionExpression: "attribute_exists(#pk) AND #ownerPk = :ownerPk AND #ownerSk = :ownerSk", ExpressionAttributeValues: expect.objectContaining({ ":ownerPk": modelPk("session"), ":ownerSk": entitySk("s1"), ":ttl": 1924992000 }) }), expect.objectContaining({ Key: { pk: uniquePk("session", "email"), sk: valueSk("a@example.com", "") }, UpdateExpression: "SET #ttl = :ttl", ExpressionAttributeValues: expect.objectContaining({ ":ttl": 1924992000 }) })]));
+    const puts = command.input.TransactItems?.flatMap((item) => (item.Put?.Item ? [item.Put.Item] : [])) ?? [];
+    expect(puts).toEqual(expect.arrayContaining([expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1"), ttl: 1924992000 }), expect.objectContaining({ pk: uniquePk("session", "email"), sk: valueSk("a@example.com", ""), ttl: 1924992000 })]));
     const keys = command.input.TransactItems?.map((item) => `${item.Put?.Item?.pk ?? item.Delete?.Key?.pk ?? item.Update?.Key?.pk}\u0000${item.Put?.Item?.sk ?? item.Delete?.Key?.sk ?? item.Update?.Key?.sk}`) ?? [];
     expect(new Set(keys).size).toBe(keys.length);
-    expect(updates.every((update) => update.ReturnValuesOnConditionCheckFailure === "ALL_OLD")).toBe(true);
+    expect(command.input.TransactItems?.every((item) => item.Put?.ReturnValuesOnConditionCheckFailure === undefined)).toBe(true);
   });
 
   it("shortens and removes retained sidecar TTL metadata atomically", async () => {
@@ -64,11 +64,11 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, ttl: { defaultField: "expiresAt" }, uniqueFields: { session: ["email"] } });
     await store.update("session", [eq("id", "s1")], { expiresAt: "2030-01-01T00:00:00.000Z" });
     let command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.some((item) => item.Update?.UpdateExpression === "SET #ttl = :ttl" && item.Update.ExpressionAttributeValues?.[":ttl"] === 1893456000)).toBe(true);
+    expect(command.input.TransactItems?.some((item) => item.Put?.Item?.ttl === 1893456000)).toBe(true);
     doc.send.mockClear();
     await store.update("session", [eq("id", "s1")], { expiresAt: null });
     command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.some((item) => item.Update?.UpdateExpression === "REMOVE #ttl" && item.Update.ExpressionAttributeValues?.[":ownerPk"] === modelPk("session"))).toBe(true);
+    expect(command.input.TransactItems?.some((item) => item.Put?.Item && !Object.hasOwn(item.Put.Item, "ttl") && item.Put.Item.pk === indexPk("session", "email", "a@example.com"))).toBe(true);
   });
 
   it("uses transactional uniqueness locks for configured unique fields", async () => {
@@ -273,7 +273,7 @@ describe("DynamoDBStore", () => {
     await expect(store.consumeOne("verification", [eq("id", "v1"), eq("token", "t")])).resolves.toEqual({ id: "v1", token: "t" });
     expect(doc.send.mock.calls[1]?.[0]).toBeInstanceOf(TransactWriteCommand);
     expect((doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems?.[0]?.Delete?.ExpressionAttributeValues).toEqual({ ":revision": "rev-1" });
-    expect((doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems?.[0]?.Delete?.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD");
+    expect((doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems?.[0]?.Delete?.ReturnValuesOnConditionCheckFailure).toBeUndefined();
   });
 
   it("returns null for consumeOne races that fail after the target read", async () => {
@@ -608,6 +608,31 @@ describe("DynamoDBStore", () => {
     });
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { user: ["email"] } });
     await expect(store.update("user", [eq("id", "u1")], { email: "new@example.com" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+  });
+
+  it("never exposes stored item contents through conflict error causes", async () => {
+    const row = { pk: modelPk("account"), sk: entitySk("a1"), id: "a1", password: "hash", entity: { id: "a1", password: "hash" }, ...rev };
+    const doc = client([row]);
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof GetCommand) return { Item: row };
+      const error = new Error("Transaction cancelled [ConditionalCheckFailed]");
+      error.name = "TransactionCanceledException";
+      Object.assign(error, { CancellationReasons: [{ Code: "ConditionalCheckFailed", Item: { password: { S: "hash" }, accessToken: { S: "secret" } } }] });
+      throw error;
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    const error = await store.update("account", [eq("id", "a1")], { password: "new-hash" }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DynamoDBConflictError);
+    expect((error as Error).cause).toEqual({ name: "TransactionCanceledException", message: "Transaction cancelled [ConditionalCheckFailed]", cancellationCodes: ["ConditionalCheckFailed"] });
+    expect(JSON.stringify((error as Error).cause)).not.toMatch(/hash|secret/);
+    const commands = doc.send.mock.calls.map((call) => call[0]).filter((command) => command instanceof TransactWriteCommand) as TransactWriteCommand[];
+    const actions = commands.flatMap((command) => command.input.TransactItems ?? []);
+    expect(actions.every((action) => Object.values(action).every((op) => (op as { ReturnValuesOnConditionCheckFailure?: string }).ReturnValuesOnConditionCheckFailure === undefined))).toBe(true);
+  });
+
+  it("redacts non-object causes to empty fields", async () => {
+    const { redactedAwsError } = await import("../src/errors.js");
+    expect(redactedAwsError("boom")).toEqual({ name: "", message: "", cancellationCodes: [] });
   });
 
   it("does not classify non-conditional transaction cancellations as write conflicts", async () => {

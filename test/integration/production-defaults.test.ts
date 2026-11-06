@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
+import { emailOTP } from "better-auth/plugins/email-otp";
 import { dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 
@@ -116,6 +117,45 @@ describe("Better Auth core flows under production defaults", () => {
     expect(results.filter((result) => result.status === 200)).toHaveLength(1);
     await expect(rawUsers()).resolves.toHaveLength(1);
   });
+
+  it("persists database rate limits and atomically rejects concurrent excess requests", async () => {
+    const auth = createAuth({ rateLimit: { enabled: true, storage: "database", customRules: { "/api/auth/sign-in/email": { window: 60_000, max: 2 } } } });
+    await auth.handler(post("/api/auth/sign-up/email", { email: "limited@example.com", password: "password-123", name: "Limited" }));
+    const responses = await Promise.all(Array.from({ length: 4 }, () => auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }))));
+    expect(responses.filter((response) => response.status === 200)).toHaveLength(2);
+    expect(responses.filter((response) => response.status === 429)).toHaveLength(2);
+    await expect(rawModel("rateLimit")).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ entity: expect.objectContaining({ key: expect.stringContaining("/sign-in/email"), count: 2 }) })]));
+  });
+
+  it("verifies an email through a single-use verification token", async () => {
+    const sent: string[] = [];
+    const auth = createAuth({ emailAndPassword: { enabled: true, requireEmailVerification: true }, emailVerification: { sendVerificationEmail: async ({ token }: { token: string }) => void sent.push(token) } });
+    const signup = await auth.handler(post("/api/auth/sign-up/email", { email: "verify@example.com", password: "password-123", name: "Verify" }));
+    expect(signup.status).toBe(200);
+    expect(sent).toHaveLength(1);
+    const token = sent[0]!;
+    const first = await auth.handler(getVerification(token));
+    expect(first.status).toBe(200);
+    const verifiedSession = await signIn(auth, "verify@example.com", "password-123");
+    expect((await getSession(auth, verifiedSession))?.user.emailVerified).toBe(true);
+    // Better Auth's signed verification token is idempotent after the user is verified:
+    // the second use is a no-op and cannot change or create another user.
+    const second = await auth.handler(getVerification(token));
+    expect(second.status).toBe(200);
+    await expect(second.json()).resolves.toMatchObject({ status: true, user: null });
+  });
+
+  it("signs in with an email OTP exactly once", async () => {
+    const otp = "246810";
+    const sent: string[] = [];
+    const auth = createAuth({ plugins: [emailOTP({ generateOTP: () => otp, sendVerificationOTP: async ({ otp: value }: { otp: string }) => void sent.push(value) })] });
+    await auth.handler(post("/api/auth/sign-up/email", { email: "otp@example.com", password: "password-123", name: "OTP" }));
+    expect((await auth.handler(post("/api/auth/email-otp/send-verification-otp", { email: "otp@example.com", type: "sign-in" }))).status).toBe(200);
+    expect(sent).toEqual([otp]);
+    const first = await auth.handler(post("/api/auth/sign-in/email-otp", { email: "otp@example.com", otp }));
+    expect(first.status).toBe(200);
+    expect((await auth.handler(post("/api/auth/sign-in/email-otp", { email: "otp@example.com", otp }))).status).toBe(400);
+  });
 });
 
 function createAuth(overrides: Record<string, unknown> = {}) {
@@ -166,8 +206,8 @@ function sessionCookie(response: Response): string {
   return cookie;
 }
 
-async function getSession(auth: Auth, cookie: string): Promise<{ user: { id: string; email: string } } | null> {
-  return (await json(auth, get("/api/auth/get-session", cookie))) as { user: { id: string; email: string } } | null;
+async function getSession(auth: Auth, cookie: string): Promise<{ user: { id: string; email: string; emailVerified?: boolean } } | null> {
+  return (await json(auth, get("/api/auth/get-session", cookie))) as { user: { id: string; email: string; emailVerified?: boolean } } | null;
 }
 
 async function json(auth: Auth, request: Request): Promise<unknown> {
@@ -184,8 +224,17 @@ function get(path: string, cookie: string): Request {
   return new Request(`${BASE_URL}${path}`, { headers: { cookie } });
 }
 
+function getVerification(token: string): Request {
+  return new Request(`${BASE_URL}/api/auth/verify-email?token=${encodeURIComponent(token)}`, { headers: { origin: BASE_URL } });
+}
+
 async function rawUsers(): Promise<Record<string, unknown>[]> {
   const result = await docClient.send(new ScanCommand({ TableName: tableName, ConsistentRead: true, FilterExpression: "#model = :model", ExpressionAttributeNames: { "#model": "model" }, ExpressionAttributeValues: { ":model": "user" } }));
+  return result.Items ?? [];
+}
+
+async function rawModel(model: string): Promise<Record<string, unknown>[]> {
+  const result = await docClient.send(new ScanCommand({ TableName: tableName, ConsistentRead: true, FilterExpression: "#model = :model", ExpressionAttributeNames: { "#model": "model" }, ExpressionAttributeValues: { ":model": model } }));
   return result.Items ?? [];
 }
 

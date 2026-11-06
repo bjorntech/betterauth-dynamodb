@@ -28,7 +28,11 @@ describe("serialization helpers", () => {
     expect(compoundUniqueSk(["1", 2])).not.toBe(compoundUniqueSk([1, "2"]));
     expect(compoundUniqueSk(["a#b", "c"])).not.toBe(compoundUniqueSk(["a", "b#c"]));
     expect(compoundUniqueSk(["ab", ""])).not.toBe(compoundUniqueSk(["a", "b"]));
-    expect(toSchemaUniqueLocks("user", { id: "u1", email: "a", provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(1);
+    const lock = toSchemaUniqueLocks("user", { id: "u1", email: "a", provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])[0];
+    expect(lock).toBeDefined();
+    expect(lock).toMatchObject({ entity: { ownerPk: modelPk("user"), ownerSk: entitySk("u1"), fields: ["email", "provider"] } });
+    expect(lock).not.toHaveProperty("entity.values");
+    expect(JSON.stringify(lock)).not.toContain("google");
     expect(toSchemaUniqueLocks("user", { id: "u1", email: null, provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(0);
     expect(toSchemaUniqueLocks("user", { id: "u1", provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(0);
     expect(toSchemaUniqueLocks("user", { id: "u1", email: "a", provider: undefined }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(0);

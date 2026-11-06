@@ -47,3 +47,13 @@ function hasCancellationReasons(error: unknown): error is { CancellationReasons:
 function isNamed(error: unknown, name: string): boolean {
   return typeof error === "object" && error !== null && "name" in error && error.name === name;
 }
+
+/** Conflict causes keep the AWS error name, message, and cancellation codes but never item contents (CancellationReasons[].Item). */
+export function redactedAwsError(error: unknown): { name: string; message: string; cancellationCodes: string[] } {
+  return { name: errorField(error, "name"), message: errorField(error, "message"), cancellationCodes: cancellationCodes(error) };
+}
+
+function errorField(error: unknown, field: "name" | "message"): string {
+  if (typeof error !== "object" || error === null || !(field in error)) return "";
+  return String((error as Record<string, unknown>)[field]);
+}
