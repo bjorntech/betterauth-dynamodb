@@ -182,7 +182,7 @@ export class DynamoDBStore {
     const newSidecars = this.allSidecars(model, newItem.entity);
     const deletes = removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item));
     const puts = addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item));
-    const updates = retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl));
+    const updates = retainedSidecars(oldSidecars, newSidecars).map(([, newSidecar]) => rewriteSidecarOf(this.options.tableName, newSidecar));
     const condition = revisionCondition(oldItem);
     const entity = { Put: { TableName: this.options.tableName, Item: newItem, ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
     const actions = [entity, ...deletes, ...puts, ...updates, ...this.retiredSidecarDeletes(model, oldItem.entity)];
@@ -202,7 +202,7 @@ export class DynamoDBStore {
   private async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
     const oldSidecars = this.allSidecars(model, oldItem.entity);
     const newSidecars = this.allSidecars(model, newItem.entity);
-    const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl)), ...this.retiredSidecarDeletes(model, oldItem.entity)];
+    const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).map(([, newSidecar]) => rewriteSidecarOf(this.options.tableName, newSidecar)), ...this.retiredSidecarDeletes(model, oldItem.entity)];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
@@ -316,29 +316,9 @@ function putNewOf(tableName: string, item: StoredItem | SidecarItem) {
   return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(pk)", ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
 }
 
-function ttlUpdateOf(tableName: string, oldItem: SidecarItem, newItem: SidecarItem, ttl?: false | TtlOptions) {
-  if (!ttl) return [];
-  const attribute = ttlAttribute(ttl);
-  const oldTtl = oldItem[attribute];
-  const newTtl = newItem[attribute];
-  if (oldTtl === newTtl) return [];
-  return [newTtl === undefined ? removeTtlOf(tableName, newItem, attribute) : setTtlOf(tableName, newItem, attribute, newTtl)];
-}
-
-function setTtlOf(tableName: string, item: SidecarItem, attribute: string, ttlValue: unknown) {
-  return { Update: { ...ownerUpdateBase(tableName, item, attribute), UpdateExpression: "SET #ttl = :ttl", ExpressionAttributeValues: { ...ownerValues(item), ":ttl": ttlValue } } };
-}
-
-function removeTtlOf(tableName: string, item: SidecarItem, attribute: string) {
-  return { Update: { ...ownerUpdateBase(tableName, item, attribute), UpdateExpression: "REMOVE #ttl", ExpressionAttributeValues: ownerValues(item) } };
-}
-
-function ownerUpdateBase(tableName: string, item: SidecarItem, ttlName: string) {
-  return { TableName: tableName, Key: keyOf(item), ConditionExpression: "attribute_exists(#pk) AND #ownerPk = :ownerPk AND #ownerSk = :ownerSk", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk", "#ttl": ttlName }, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const };
-}
-
-function ownerValues(item: SidecarItem) {
-  return { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk };
+/** Replace an existing sidecar/lock while refusing to overwrite another owner's row. */
+function rewriteSidecarOf(tableName: string, item: SidecarItem) {
+  return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk }, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
 }
 
 function incrementUpdateOf(tableName: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, ttl?: false | TtlOptions) {

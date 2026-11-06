@@ -46,7 +46,7 @@ export function toSchemaUniqueLocks(model: string, data: Record<string, unknown>
   return indexes.flatMap((index) => {
     const values = index.fields.map((field) => data[field]);
     if (values.some((value) => value === undefined || value === null)) return [];
-    const item: SidecarItem = { pk: compoundUniquePk(model, index.name), sk: compoundUniqueSk(values), model: `_unique2_${model}`, id: `${index.name}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), fields: index.fields, values }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
+    const item: SidecarItem = { pk: compoundUniquePk(model, index.name), sk: compoundUniqueSk(values), model: `_unique2_${model}`, id: `${index.name}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), fields: index.fields }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
     if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
     return [item];
   });

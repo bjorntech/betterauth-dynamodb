@@ -51,8 +51,8 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, ttl: { defaultField: "expiresAt" }, uniqueFields: { session: ["email"] } });
     await store.update("session", [eq("id", "s1")], { expiresAt: "2031-01-01T00:00:00.000Z" });
     const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    const updates = command.input.TransactItems?.flatMap((item) => (item.Update ? [item.Update] : [])) ?? [];
-    expect(updates).toEqual(expect.arrayContaining([expect.objectContaining({ Key: expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1") }), UpdateExpression: "SET #ttl = :ttl", ConditionExpression: "attribute_exists(#pk) AND #ownerPk = :ownerPk AND #ownerSk = :ownerSk", ExpressionAttributeValues: expect.objectContaining({ ":ownerPk": modelPk("session"), ":ownerSk": entitySk("s1"), ":ttl": 1924992000 }) }), expect.objectContaining({ Key: { pk: uniquePk("session", "email"), sk: valueSk("a@example.com", "") }, UpdateExpression: "SET #ttl = :ttl", ExpressionAttributeValues: expect.objectContaining({ ":ttl": 1924992000 }) })]));
+    const puts = command.input.TransactItems?.flatMap((item) => (item.Put?.Item ? [item.Put.Item] : [])) ?? [];
+    expect(puts).toEqual(expect.arrayContaining([expect.objectContaining({ pk: indexPk("session", "email", "a@example.com"), sk: indexSk("s1"), ttl: 1924992000 }), expect.objectContaining({ pk: uniquePk("session", "email"), sk: valueSk("a@example.com", ""), ttl: 1924992000 })]));
     const keys = command.input.TransactItems?.map((item) => `${item.Put?.Item?.pk ?? item.Delete?.Key?.pk ?? item.Update?.Key?.pk}\u0000${item.Put?.Item?.sk ?? item.Delete?.Key?.sk ?? item.Update?.Key?.sk}`) ?? [];
     expect(new Set(keys).size).toBe(keys.length);
     expect(updates.every((update) => update.ReturnValuesOnConditionCheckFailure === "ALL_OLD")).toBe(true);
@@ -64,11 +64,11 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, ttl: { defaultField: "expiresAt" }, uniqueFields: { session: ["email"] } });
     await store.update("session", [eq("id", "s1")], { expiresAt: "2030-01-01T00:00:00.000Z" });
     let command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.some((item) => item.Update?.UpdateExpression === "SET #ttl = :ttl" && item.Update.ExpressionAttributeValues?.[":ttl"] === 1893456000)).toBe(true);
+    expect(command.input.TransactItems?.some((item) => item.Put?.Item?.ttl === 1893456000)).toBe(true);
     doc.send.mockClear();
     await store.update("session", [eq("id", "s1")], { expiresAt: null });
     command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.some((item) => item.Update?.UpdateExpression === "REMOVE #ttl" && item.Update.ExpressionAttributeValues?.[":ownerPk"] === modelPk("session"))).toBe(true);
+    expect(command.input.TransactItems?.some((item) => item.Put?.Item && !Object.hasOwn(item.Put.Item, "ttl") && item.Put.Item.pk === indexPk("session", "email", "a@example.com"))).toBe(true);
   });
 
   it("uses transactional uniqueness locks for configured unique fields", async () => {
