@@ -8,7 +8,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { createDocumentClient, normalizeOptions } from "./client.js";
-import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, transactionCancellationCodes } from "./errors.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, redactedAwsError, transactionCancellationCodes } from "./errors.js";
 import { entitySk, indexPk, modelPk } from "./keys.js";
 import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
 import type { CleanedWhere, DynamoDBStoreOptions, PlannerHints, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
@@ -184,7 +184,7 @@ export class DynamoDBStore {
     const puts = addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item));
     const updates = retainedSidecars(oldSidecars, newSidecars).map(([, newSidecar]) => rewriteSidecarOf(this.options.tableName, newSidecar));
     const condition = revisionCondition(oldItem);
-    const entity = { Put: { TableName: this.options.tableName, Item: newItem, ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+    const entity = { Put: { TableName: this.options.tableName, Item: newItem, ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values } };
     const actions = [entity, ...deletes, ...puts, ...updates, ...this.retiredSidecarDeletes(model, oldItem.entity)];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
@@ -192,7 +192,7 @@ export class DynamoDBStore {
 
   private async transactDelete(item: StoredItem): Promise<void> {
     const condition = revisionCondition(item);
-    const entity = { Delete: { TableName: this.options.tableName, Key: keyOf(item), ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+    const entity = { Delete: { TableName: this.options.tableName, Key: keyOf(item), ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values } };
     const sidecars = this.allSidecars(String(item.model), item.entity).map((sidecar) => deleteOf(this.options.tableName, sidecar));
     const actions = [entity, ...sidecars, ...this.retiredSidecarDeletes(String(item.model), item.entity)];
     assertTransactionActions(actions);
@@ -309,21 +309,21 @@ function dateSortValue(left: unknown, right: unknown): number | null {
 }
 
 function deleteOf(tableName: string, item: SidecarItem) {
-  return { Delete: { TableName: tableName, Key: keyOf(item), ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk }, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+  return { Delete: { TableName: tableName, Key: keyOf(item), ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk } } };
 }
 
 function putNewOf(tableName: string, item: StoredItem | SidecarItem) {
-  return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(pk)", ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+  return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(pk)" } };
 }
 
 /** Replace an existing sidecar/lock while refusing to overwrite another owner's row. */
 function rewriteSidecarOf(tableName: string, item: SidecarItem) {
-  return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk }, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+  return { Put: { TableName: tableName, Item: item, ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk } } };
 }
 
 function incrementUpdateOf(tableName: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, ttl?: false | TtlOptions) {
   const expression = incrementUpdateExpression(oldItem, newItem, increment, set, ttl);
-  return { Update: { TableName: tableName, Key: keyOf(oldItem), ConditionExpression: expression.condition.expression, UpdateExpression: expression.update, ExpressionAttributeNames: expression.names, ExpressionAttributeValues: expression.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+  return { Update: { TableName: tableName, Key: keyOf(oldItem), ConditionExpression: expression.condition.expression, UpdateExpression: expression.update, ExpressionAttributeNames: expression.names, ExpressionAttributeValues: expression.values } };
 }
 
 function incrementUpdateExpression(oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, ttl?: false | TtlOptions) {
@@ -492,7 +492,7 @@ function newClientRequestToken(): string {
 }
 
 function conflictError(operation: string, cause: unknown): DynamoDBConflictError {
-  return new DynamoDBConflictError(`Better Auth DynamoDB ${operation} conflicted with a concurrent write after the target row was read. Retry the operation.`, { cause });
+  return new DynamoDBConflictError(`Better Auth DynamoDB ${operation} conflicted with a concurrent write after the target row was read. Retry the operation.`, { cause: redactedAwsError(cause) });
 }
 
 function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, budget?: { remaining: number }): Promise<T[]> {
