@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Tests
+
+- Adds production-default Better Auth integration coverage for database-backed rate limiting, email verification, email OTP sign-in, and existing core authentication flows without `unsafeAllowScan`.
+
 ### Changed (storage format, backwards compatible)
 
 - `id` no longer gets a scalar sidecar: it is the entity key and the planner always reads it with `GetItem`. Creates write one fewer transactional action.
