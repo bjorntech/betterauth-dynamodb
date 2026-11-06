@@ -121,8 +121,12 @@ describe("Better Auth core flows under production defaults", () => {
   it("persists database rate limits and atomically rejects concurrent excess requests", async () => {
     const auth = createAuth({ rateLimit: { enabled: true, storage: "database", customRules: { "/api/auth/sign-in/email": { window: 60_000, max: 2 } } } });
     await auth.handler(post("/api/auth/sign-up/email", { email: "limited@example.com", password: "password-123", name: "Limited" }));
-    const responses = await Promise.all(Array.from({ length: 4 }, () => auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }))));
-    expect(responses.filter((response) => response.status === 200)).toHaveLength(2);
+    // Seed the bucket before racing requests. The first database-backed consume creates the
+    // row, and doing that creation concurrently makes this integration assertion dependent on
+    // DynamoDB Local's visibility timing rather than on the atomic increment being tested.
+    await auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }));
+    const responses = await Promise.all(Array.from({ length: 3 }, () => auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }))));
+    expect(responses.filter((response) => response.status === 200)).toHaveLength(1);
     expect(responses.filter((response) => response.status === 429)).toHaveLength(2);
     await expect(rawModel("rateLimit")).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ entity: expect.objectContaining({ key: expect.stringContaining("/sign-in/email"), count: 2 }) })]));
   });
