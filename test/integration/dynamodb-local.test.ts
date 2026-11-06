@@ -6,7 +6,7 @@ import {
   ResourceNotFoundException,
   waitUntilTableExists
 } from "@aws-sdk/client-dynamodb";
-import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
@@ -387,6 +387,30 @@ describe("DynamoDB Local adapter integration", () => {
     expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
     expect(attempts.filter((attempt) => attempt.status === "rejected")).toHaveLength(1);
     await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-1")], limit: 10 })).resolves.toHaveLength(1);
+  });
+
+  it("does not store plaintext schema tuples and rewrites legacy sidecars and locks", async () => {
+    const adapter = schemaIndexAdapter(true);
+    await create(adapter, "oauthClientResource", { id: "legacy-redact", clientId: "client-redact", resourceId: "resource-redact", note: "before" });
+    const ownerPk = modelPk("oauthClientResource");
+    const ownerSk = entitySk("legacy-redact");
+    const sidecarKey = { pk: indexPk("oauthClientResource", "clientId", "client-redact"), sk: indexSk("legacy-redact") };
+    const lockKey = { pk: uniquePk("oauthClientResource", "clientId"), sk: valueSk("client-redact", "") };
+    const tupleKey = { pk: compoundUniquePk("oauthClientResource", compoundUniqueIndexName(["clientId", "resourceId"])), sk: compoundUniqueSk(["client-redact", "resource-redact"]) };
+    const owner = { ownerPk, ownerSk };
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...sidecarKey, model: "_index_oauthClientResource", id: "clientId:legacy-redact", entity: { ...owner, field: "clientId", value: "client-redact" }, ...owner, indexModel: "oauthClientResource", indexField: "clientId", indexValue: "client-redact" } }));
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...lockKey, model: "_unique_oauthClientResource", id: "clientId:client-redact", entity: { ...owner, field: "clientId", value: "client-redact" }, ...owner } }));
+    await docClient.send(new PutCommand({ TableName: tableName, Item: { ...tupleKey, model: "_unique2_oauthClientResource", id: "clientId_resourceId:legacy-redact", entity: { ...owner, fields: ["clientId", "resourceId"], values: ["client-redact", "resource-redact"] }, ...owner } }));
+
+    await expect(adapter.findOne({ model: "oauthClientResource", where: [eq("clientId", "client-redact")] })).resolves.toMatchObject({ id: "legacy-redact" });
+    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "legacy-redact")], update: { note: "after" } })).resolves.toMatchObject({ note: "after" });
+    for (const row of [await rawRow(sidecarKey.pk, sidecarKey.sk), await rawRow(lockKey.pk, lockKey.sk), await rawRow(tupleKey.pk, tupleKey.sk)]) {
+      expect(JSON.stringify(row)).not.toContain("client-redact");
+      expect(JSON.stringify(row)).not.toContain("resource-redact");
+      expect(row).not.toHaveProperty("indexValue");
+      expect(row).not.toHaveProperty("entity.value");
+      expect(row).not.toHaveProperty("entity.values");
+    }
   });
 
   it("cleans compound locks across conflicting update and delete operations", async () => {
