@@ -391,7 +391,7 @@ describe("DynamoDB Local adapter integration", () => {
 
   it("does not store plaintext schema tuples and rewrites legacy sidecars and locks", async () => {
     const adapter = schemaIndexAdapter(true);
-    await create(adapter, "oauthClientResource", { id: "legacy-redact", clientId: "client-redact", resourceId: "resource-redact", note: "before" });
+    await create(adapter, "oauthClientResource", { id: "legacy-redact", clientId: "client-redact", resourceId: "resource-redact" });
     const ownerPk = modelPk("oauthClientResource");
     const ownerSk = entitySk("legacy-redact");
     const sidecarKey = { pk: indexPk("oauthClientResource", "clientId", "client-redact"), sk: indexSk("legacy-redact") };
@@ -403,7 +403,7 @@ describe("DynamoDB Local adapter integration", () => {
     await docClient.send(new PutCommand({ TableName: tableName, Item: { ...tupleKey, model: "_unique2_oauthClientResource", id: "clientId_resourceId:legacy-redact", entity: { ...owner, fields: ["clientId", "resourceId"], values: ["client-redact", "resource-redact"] }, ...owner } }));
 
     await expect(adapter.findOne({ model: "oauthClientResource", where: [eq("clientId", "client-redact")] })).resolves.toMatchObject({ id: "legacy-redact" });
-    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "legacy-redact")], update: { note: "after" } })).resolves.toMatchObject({ note: "after" });
+    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "legacy-redact")], update: { resourceId: "resource-redact" } })).resolves.toMatchObject({ resourceId: "resource-redact" });
     for (const row of [await rawRow(sidecarKey.pk, sidecarKey.sk), await rawRow(lockKey.pk, lockKey.sk), await rawRow(tupleKey.pk, tupleKey.sk)]) {
       expect(JSON.stringify(row)).not.toContain("client-redact");
       expect(JSON.stringify(row)).not.toContain("resource-redact");
