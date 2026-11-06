@@ -119,16 +119,15 @@ describe("Better Auth core flows under production defaults", () => {
   });
 
   it("persists database rate limits and atomically rejects concurrent excess requests", async () => {
-    const auth = createAuth({ rateLimit: { enabled: true, storage: "database", customRules: { "/api/auth/sign-in/email": { window: 60_000, max: 2 } } } });
-    await auth.handler(post("/api/auth/sign-up/email", { email: "limited@example.com", password: "password-123", name: "Limited" }));
-    // Seed the bucket before racing requests. The first database-backed consume creates the
-    // row, and doing that creation concurrently makes this integration assertion dependent on
-    // DynamoDB Local's visibility timing rather than on the atomic increment being tested.
-    await auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }));
-    const responses = await Promise.all(Array.from({ length: 3 }, () => auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }))));
-    expect(responses.filter((response) => response.status === 200)).toHaveLength(1);
-    expect(responses.filter((response) => response.status === 429)).toHaveLength(2);
-    await expect(rawModel("rateLimit")).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ entity: expect.objectContaining({ key: expect.stringContaining("/sign-in/email"), count: 2 }) })]));
+    // customRules keys are basePath-relative, and window is in seconds.
+    const auth = createAuth({ rateLimit: { enabled: true, storage: "database", customRules: { "/sign-in/email": { window: 60, max: 2 } } } });
+    const responses = await Promise.all(Array.from({ length: 8 }, () => auth.handler(post("/api/auth/sign-in/email", { email: "limited@example.com", password: "password-123" }))));
+    expect(responses.filter((response) => response.status === 401)).toHaveLength(2);
+    expect(responses.filter((response) => response.status === 429)).toHaveLength(6);
+    // Four or more requests distinguish the custom max of 2 from the built-in max of 3.
+    const rows = (await rawModel("rateLimit")).filter((row) => String((row.entity as { key?: string })?.key).includes("/sign-in/email"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual(expect.objectContaining({ entity: expect.objectContaining({ count: 2 }) }));
   });
 
   it("verifies an email through a single-use verification token", async () => {
