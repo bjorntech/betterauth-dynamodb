@@ -1,6 +1,6 @@
 # @bjorntech/betterauth-dynamodb
 
-Production-oriented DynamoDB adapter targeting Better Auth `^1.6.25` via the official `createAdapterFactory` API.
+Production-oriented DynamoDB adapter supporting Better Auth `^1.6.25` via the official `createAdapterFactory` API.
 
 ## Status
 
@@ -9,6 +9,8 @@ This package is published on npm as `@bjorntech/betterauth-dynamodb`. The reposi
 Storage compatibility note: the current storage format uses transactionally maintained scalar equality sidecar rows in the base table, delimiter-safe length-prefixed key components, SHA-256 hashes for sidecar/unique-lock values, and hidden internal revision metadata for ABA-safe mutations. Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
 
 Upgrade note: 1.0.1 to 1.1.0 requires no migration when `enforceSchemaUniqueIndexes` remains at its default `false`, and `IN` support requires no migration. For existing records, opting into new schema unique constraints requires a stopped-write audit, duplicate repair, and application-owned lock backfill before all compatible writers restart with enforcement enabled. New empty affected models need no backfill. No migration utility is supplied.
+
+**Use Better Auth 1.7.16 or newer for security fixes.** The adapter retains compatibility with older versions starting at 1.6.25 (`^1.6.25`). Consuming applications must upgrade their Better Auth runtime; updating the adapter alone does not patch it.
 
 ## Installation
 
@@ -124,9 +126,9 @@ bun run verify
 bun run test:integration:local
 ```
 
-`bun run verify` runs typecheck, ESLint, coverage tests, CRAP check, and build. The package is tested against Better Auth 1.7.5 and requires Better Auth `^1.6.25` as a peer dependency. `bun run test:integration:local` starts DynamoDB Local in Docker using a random mapped port, fake credentials, in-memory shared DB mode, telemetry disabled, and isolated tables for the local integration and separate adapter conformance suites.
+`bun run verify` runs typecheck, ESLint, coverage tests, and build. The package is tested against Better Auth 1.7.16 and supports Better Auth `^1.6.25` as a peer dependency. `bun run test:integration:local` starts DynamoDB Local in Docker using a random mapped port, fake credentials, in-memory shared DB mode, telemetry disabled, and isolated tables for the local integration and separate adapter conformance suites.
 
-Provider coverage uses the published `@better-auth/oauth-provider` 1.7.5 plugin schema and direct query-shape tests, plus ordinary Better Auth HTTP authentication flows. It does not include the provider's full OAuth endpoint surface.
+Provider coverage uses the published `@better-auth/oauth-provider` 1.7.16 plugin schema and direct query-shape tests, plus ordinary Better Auth HTTP authentication flows. It does not include the provider's full OAuth endpoint surface.
 
 Coverage thresholds are enforced for production `src` code (excluding pure types). CRAP is computed per production function as:
 
