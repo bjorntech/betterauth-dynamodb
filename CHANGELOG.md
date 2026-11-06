@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Adds Better Auth 1.7.16 compatibility coverage.
+
+### Changed
+
+- Supports the Better Auth peer range `^1.6.25`; development and compatibility
+  coverage use Better Auth 1.7.16.
+- Updates Better Auth development/test dependencies to 1.7.16 and upgrades test
+  tooling to Vitest 4.
+
+### Compatibility
+
+- No adapter runtime or DynamoDB storage-format changes are included, so this
+  work requires no storage migration.
+- Applications should upgrade Better Auth to 1.7.16 or later for security;
+  updating this adapter alone does not upgrade or patch the consuming
+  application's Better Auth runtime.
+
 ## [1.1.0] - 2026-09-19
 
 ### Added
@@ -43,6 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
+[Unreleased]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0

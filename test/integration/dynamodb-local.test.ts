@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
+import { emailOTP } from "better-auth/plugins/email-otp";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
@@ -198,6 +199,100 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(rawRow(modelPk("session"), entitySk("expired"))).resolves.toMatchObject({ ttl: 946684800 });
     await expect(adapter.findOne({ model: "session", where: [eq("id", "expired")] })).resolves.toBeNull();
     await expect(adapter.findMany({ model: "session", where: [eq("userId", "u1")], limit: 10 })).resolves.toEqual([]);
+  });
+
+  it("does not resurrect an older expired verification row after the latest expires", async () => {
+    const adapter = adapterFor({ client: docClient, ttl: { fields: { verification: "expiresAt" } } });
+    await create(adapter, "verification", {
+      id: "expired-old",
+      identifier: "email-otp:expired@example.com",
+      value: "old:0",
+      createdAt: new Date("2020-01-01T00:00:00.100Z"),
+      expiresAt: "2020-01-01T00:00:01.000Z"
+    });
+    await create(adapter, "verification", {
+      id: "expired-latest",
+      identifier: "email-otp:expired@example.com",
+      value: "latest:0",
+      createdAt: new Date("2020-01-01T00:00:00.900Z"),
+      expiresAt: "2020-01-01T00:00:02.000Z"
+    });
+
+    // Both rows are expired, so logical TTL hiding must happen before the
+    // Better Auth verification lookup can select a row by createdAt.
+    await expect(adapter.findMany({ model: "verification", where: [eq("identifier", "email-otp:expired@example.com")], limit: 1, sortBy: { field: "createdAt", direction: "desc" } })).resolves.toEqual([]);
+  });
+
+  it("serializes concurrent Better Auth OTP guesses through one comparison", async () => {
+    const email = "otp-race@example.com";
+    const otp = "654321";
+    let comparisons = 0;
+    let signalComparison!: () => void;
+    const comparisonStarted = new Promise<void>((resolve) => { signalComparison = resolve; });
+    let releaseComparison!: () => void;
+    const comparisonHeld = new Promise<void>((resolve) => { releaseComparison = resolve; });
+
+    const auth = betterAuth({
+      secret: "test-secret-that-is-long-enough-for-better-auth",
+      baseURL: "http://localhost:3000",
+      database: dynamoDBAdapter({ tableName, client: docClient }),
+      emailAndPassword: { enabled: true },
+      verification: { disableCleanup: true },
+      plugins: [emailOTP({
+        allowedAttempts: 1,
+        generateOTP: () => otp,
+        async sendVerificationOTP() {},
+        storeOTP: {
+          async hash(value) {
+            if (value === "000000" || value === "111111") {
+              comparisons += 1;
+              if (value === "000000") {
+                signalComparison();
+                await comparisonHeld;
+              }
+            }
+            return `stored-${value}`;
+          }
+        }
+      })]
+    });
+
+    await expect(auth.handler(jsonRequest("/api/auth/email-otp/send-verification-otp", { email, type: "sign-in" }))).resolves.toMatchObject({ status: 200 });
+    const first = auth.handler(jsonRequest("/api/auth/email-otp/check-verification-otp", { email, type: "sign-in", otp: "000000" }));
+    const firstOutcome = first.then(
+      (response) => ({ kind: "fulfilled" as const, response }),
+      (error) => ({ kind: "rejected" as const, error })
+    );
+    let second: Response | undefined;
+    let coordinationError: unknown;
+    try {
+      const gate = await withTimeout(Promise.race([
+        comparisonStarted.then(() => "comparison-started" as const),
+        firstOutcome.then(() => "request-completed" as const)
+      ]), "the first OTP comparison to start");
+      if (gate === "request-completed") throw new Error("The first OTP request completed before storeOTP.hash reached its comparison gate.");
+      const secondRequest = auth.handler(jsonRequest("/api/auth/email-otp/check-verification-otp", { email, type: "sign-in", otp: "111111" }));
+      second = await withTimeout(secondRequest, "the concurrent second OTP request to settle");
+    } catch (error) {
+      coordinationError = error;
+    } finally {
+      releaseComparison();
+    }
+    const firstResult = await withTimeout(firstOutcome, "the first OTP request to settle");
+    if (coordinationError) throw coordinationError;
+    if (firstResult.kind === "rejected") throw firstResult.error;
+    const firstResponse = firstResult.response;
+
+    expect(firstResponse.status).toBe(400);
+    expect(second?.status).toBe(400);
+    expect(comparisons).toBe(1);
+    const context = await auth.$context;
+    const verification = await context.internalAdapter.findVerificationValue("sign-in-otp-otp-race@example.com");
+    expect(verification?.value).toMatch(/:1$/);
+
+    const later = await auth.handler(jsonRequest("/api/auth/email-otp/check-verification-otp", { email, type: "sign-in", otp }));
+    expect(later.status).toBe(403);
+    await expect(later.json()).resolves.toMatchObject({ code: "TOO_MANY_ATTEMPTS" });
   });
 
   it("stores epoch-zero TTL explicitly and treats the row as logically expired", async () => {
@@ -515,6 +610,18 @@ function realProviderAdapter(enforce: boolean): TestAdapter {
 
 function jsonRequest(path: string, body: Record<string, unknown>): Request {
   return new Request(`http://localhost:3000${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label} after ${timeoutMs}ms.`)), timeoutMs); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function create(adapter: TestAdapter, model: string, data: Record<string, unknown>): Promise<Record<string, unknown>> {

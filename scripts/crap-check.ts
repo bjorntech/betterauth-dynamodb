@@ -5,49 +5,73 @@ import { join, relative } from "node:path";
 
 const traverseAst = typeof traverse === "function" ? traverse : traverse.default;
 
-const [lcovPath, sourceRoot = "src"] = process.argv.slice(2);
-if (!lcovPath) throw new Error("Usage: bun scripts/crap-check.ts coverage/lcov.info src");
+export interface FnMetric { file: string; line: number; name: string; complexity: number }
 
-const coverage = readLcov(lcovPath);
-const functions = listFunctions(sourceRoot);
-const failures = functions.map((fn) => ({ ...fn, crap: crap(fn.complexity, lineCoverage(coverage, fn.file, fn.line)) })).filter((fn) => fn.crap > 6);
-const max = Math.max(...functions.map((fn) => crap(fn.complexity, lineCoverage(coverage, fn.file, fn.line))), 0);
+interface LcovFunction { line: number; name: string; hits?: number }
 
-console.log(`CRAP max=${max.toFixed(2)} functions=${functions.length}`);
-if (failures.length) {
-  for (const fn of failures) console.error(`${fn.file}:${fn.line} ${fn.name} complexity=${fn.complexity} crap=${fn.crap.toFixed(2)}`);
-  process.exit(1);
+export interface LcovFile {
+  lines: Map<number, number>;
+  functions: LcovFunction[];
 }
 
-interface FnMetric { file: string; line: number; name: string; complexity: number }
+export type LcovCoverage = Map<string, LcovFile>;
 
-function crap(complexity: number, coveragePercent: number): number {
+export interface EvaluatedFunction extends FnMetric {
+  coverage: number;
+  crap: number;
+}
+
+export function crap(complexity: number, coveragePercent: number): number {
   const uncovered = 1 - coveragePercent / 100;
   return complexity ** 2 * uncovered ** 3 + complexity;
 }
 
-function lineCoverage(lcov: Map<string, Map<number, number>>, file: string, line: number): number {
-  return (lcov.get(file)?.get(line) ?? 0) > 0 ? 100 : 0;
+export function evaluateFunctions(functions: FnMetric[], coverage: LcovCoverage): EvaluatedFunction[] {
+  const functionHits = matchFunctionHits(functions, coverage);
+  return functions.map((fn, index) => {
+    const covered = (functionHits[index] ?? 0) > 0 ? 100 : 0;
+    return { ...fn, coverage: covered, crap: crap(fn.complexity, covered) };
+  });
 }
 
-function readLcov(path: string): Map<string, Map<number, number>> {
-  const records = new Map<string, Map<number, number>>();
+export function parseLcov(text: string, cwd = process.cwd()): LcovCoverage {
+  const records = new Map<string, LcovFile>();
   let current = "";
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (line.startsWith("SF:")) current = relative(process.cwd(), line.slice(3));
+  for (const line of text.split("\n")) {
+    if (line.startsWith("SF:")) {
+      current = relative(cwd, line.slice(3));
+      records.set(current, { lines: new Map(), functions: [] });
+    }
     if (line.startsWith("DA:")) addLine(records, current, line);
+    if (line.startsWith("FN:")) addFunction(records, current, line);
+    if (line.startsWith("FNDA:")) addFunctionHits(records, current, line);
   }
   return records;
 }
 
-function addLine(records: Map<string, Map<number, number>>, file: string, line: string): void {
+function addLine(records: LcovCoverage, file: string, line: string): void {
+  const record = records.get(file);
+  if (!record) return;
   const [lineNo, hits] = line.slice(3).split(",").map(Number);
-  const map = records.get(file) ?? new Map<number, number>();
-  map.set(lineNo ?? 0, hits ?? 0);
-  records.set(file, map);
+  record.lines.set(lineNo ?? 0, hits ?? 0);
 }
 
-function listFunctions(root: string): FnMetric[] {
+function addFunction(records: LcovCoverage, file: string, line: string): void {
+  const record = records.get(file);
+  if (!record) return;
+  const [lineNo, ...name] = line.slice(3).split(",");
+  record.functions.push({ line: Number(lineNo), name: name.join(",") });
+}
+
+function addFunctionHits(records: LcovCoverage, file: string, line: string): void {
+  const record = records.get(file);
+  if (!record) return;
+  const [hits, ...name] = line.slice(5).split(",");
+  const fn = record.functions.find((candidate) => candidate.hits === undefined && candidate.name === name.join(","));
+  if (fn) fn.hits = Number(hits);
+}
+
+export function listFunctions(root: string): FnMetric[] {
   return walk(root).flatMap((file) => metricsForFile(file));
 }
 
@@ -56,7 +80,11 @@ function walk(dir: string): string[] {
 }
 
 function metricsForFile(file: string): FnMetric[] {
-  const ast = parse(readFileSync(file, "utf8"), { sourceType: "module", plugins: ["typescript"] });
+  return metricsForSource(readFileSync(file, "utf8"), file);
+}
+
+export function metricsForSource(source: string, file: string): FnMetric[] {
+  const ast = parse(source, { sourceType: "module", plugins: ["typescript"] });
   const metrics: FnMetric[] = [];
   traverseAst(ast, {
     Function(path: any) {
@@ -64,6 +92,50 @@ function metricsForFile(file: string): FnMetric[] {
     }
   });
   return metrics;
+}
+
+function matchFunctionHits(functions: FnMetric[], coverage: LcovCoverage): number[] {
+  const hits = new Array<number>(functions.length).fill(0);
+  const lcovNames = lcovFunctionNames(functions);
+  const byLocation = new Map<string, number[]>();
+  functions.forEach((fn, index) => {
+    const key = `${fn.file}:${fn.line}`;
+    byLocation.set(key, [...(byLocation.get(key) ?? []), index]);
+  });
+  for (const [key, indexes] of byLocation) {
+    const separator = key.lastIndexOf(":");
+    const file = key.slice(0, separator);
+    const line = Number(key.slice(separator + 1));
+    const records = coverage.get(file)?.functions.filter((fn) => fn.line === line) ?? [];
+    if (records.length !== indexes.length) continue;
+    if (!records.every((record, index) => lcovNames.get(indexes[index]!) === record.name)) continue;
+    for (const [index, record] of records.entries()) hits[indexes[index]!] = record.hits ?? 0;
+  }
+  return hits;
+}
+
+function lcovFunctionNames(functions: FnMetric[]): Map<number, string> {
+  const names = new Map<number, string>();
+  const stateByFile = new Map<string, { index: number; counts: Map<string, number> }>();
+  functions.forEach((fn, index) => {
+    const state = stateByFile.get(fn.file) ?? { index: 0, counts: new Map<string, number>() };
+    names.set(index, fn.name === "anonymous" ? `(anonymous_${state.index})` : uniqueLcovName(fn.name, state.counts));
+    state.index++;
+    stateByFile.set(fn.file, state);
+  });
+  return names;
+}
+
+function uniqueLcovName(name: string, counts: Map<string, number>): string {
+  let count = (counts.get(name) ?? 0) + 1;
+  let candidate = count > 1 ? `${name}_${count}` : name;
+  while (counts.has(candidate)) {
+    count++;
+    candidate = `${name}_${count}`;
+  }
+  counts.set(name, count);
+  if (candidate !== name) counts.set(candidate, 0);
+  return candidate;
 }
 
 function complexity(path: any): number {
@@ -84,5 +156,24 @@ function complexity(path: any): number {
 }
 
 function functionName(path: any): string {
-  return path.node.id?.name ?? path.parentPath.node.id?.name ?? path.parentPath.node.key?.name ?? "anonymous";
+  // V8's LCOV names arrows and unnamed function expressions as anonymous even
+  // when Babel can infer a name from the variable/property containing them.
+  // Only use names that are part of the function's own syntax (or a method
+  // key), otherwise a covered function can be rejected as a name mismatch.
+  if (path.node.id?.name) return path.node.id.name;
+  if (path.node.type.endsWith("Method") && path.node.key?.name) return path.node.key.name;
+  return "anonymous";
+}
+
+if (process.argv[1]?.endsWith("/scripts/crap-check.ts")) {
+  const [lcovPath, sourceRoot = "src"] = process.argv.slice(2);
+  if (!lcovPath) throw new Error("Usage: bun scripts/crap-check.ts coverage/lcov.info src");
+  const evaluated = evaluateFunctions(listFunctions(sourceRoot), parseLcov(readFileSync(lcovPath, "utf8")));
+  const failures = evaluated.filter((fn) => fn.crap > 6);
+  const max = Math.max(...evaluated.map((fn) => fn.crap), 0);
+  console.log(`CRAP max=${max.toFixed(2)} functions=${evaluated.length}`);
+  if (failures.length) {
+    for (const fn of failures) console.error(`${fn.file}:${fn.line} ${fn.name} complexity=${fn.complexity} crap=${fn.crap.toFixed(2)}`);
+    process.exit(1);
+  }
 }
